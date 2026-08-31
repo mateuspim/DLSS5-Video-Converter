@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -30,8 +31,21 @@ else:
 
 ROOT = BASE
 RUNTIME = ROOT / "bin" / "runtime"
-FFMPEG = ROOT / "bin" / "ffmpeg" / "bin" / "ffmpeg.exe"
-FFPROBE = ROOT / "bin" / "ffmpeg" / "bin" / "ffprobe.exe"
+
+
+def _media_tool(env_name: str, bundled_name: str, system_name: str) -> Path:
+    override = os.environ.get(env_name)
+    if override:
+        return Path(override)
+    bundled = ROOT / "bin" / "ffmpeg" / "bin" / bundled_name
+    if bundled.exists():
+        return bundled
+    discovered = shutil.which(system_name)
+    return Path(discovered) if discovered else bundled
+
+
+FFMPEG = _media_tool("DLSS5_FFMPEG", "ffmpeg.exe", "ffmpeg")
+FFPROBE = _media_tool("DLSS5_FFPROBE", "ffprobe.exe", "ffprobe")
 WORKER = RUNTIME / "nvngx.dll"  # executable image name required by the signed snippet caller check
 OUTPUTS = ROOT / "outputs"
 JOBS = ROOT / "jobs"
@@ -77,6 +91,7 @@ class ConversionResult:
     nr_count_evidence: int
     elapsed_seconds: float
     gpu: str
+    backend: str
 
 
 class Cancelled(RuntimeError):
@@ -236,6 +251,96 @@ def detect_gpu() -> dict:
     }
 
 
+def resolve_backend() -> str:
+    """Select an explicit backend without ever mislabeling software output as DLSS."""
+    requested = os.environ.get("DLSS5_BACKEND", "auto").strip().lower()
+    if requested not in {"auto", "dlss", "relay", "software"}:
+        raise RuntimeError("DLSS5_BACKEND must be one of: auto, dlss, relay, software")
+    runtime_ready = os.name == "nt" and WORKER.is_file() and (RUNTIME / "nvngx_dlssnr.dll").is_file()
+    if requested == "auto":
+        if os.environ.get("DLSS5_RELAY_URL"):
+            return "relay"
+        return "dlss" if runtime_ready else "software"
+    if requested == "dlss" and not runtime_ready:
+        raise RuntimeError(
+            "The DLSS backend requires Windows plus bin/runtime/nvngx.dll and "
+            "bin/runtime/nvngx_dlssnr.dll. Linux containers cannot execute this D3D12 worker."
+        )
+    if requested == "relay":
+        if not os.environ.get("DLSS5_RELAY_URL") or not os.environ.get("DLSS5_RELAY_TOKEN"):
+            raise RuntimeError("The relay backend requires DLSS5_RELAY_URL and DLSS5_RELAY_TOKEN")
+    return requested
+
+
+class RelayWorker:
+    """File-like adapter for a worker hosted by the Windows relay."""
+
+    def __init__(self, connection: socket.socket):
+        self.connection = connection
+        self.stdin = connection.makefile("wb", buffering=0)
+        self.stdout = connection.makefile("rb", buffering=0)
+        self._closed = False
+
+    @classmethod
+    def connect(cls) -> "RelayWorker":
+        relay_url = os.environ["DLSS5_RELAY_URL"]
+        host, separator, port_text = relay_url.rpartition(":")
+        if not separator or not host:
+            raise RuntimeError("DLSS5_RELAY_URL must use host:port format")
+        token = os.environ["DLSS5_RELAY_TOKEN"].encode("utf-8")
+        if not 16 <= len(token) <= 4096:
+            raise RuntimeError("DLSS5_RELAY_TOKEN must contain 16 to 4096 UTF-8 bytes")
+        connection = socket.create_connection((host, int(port_text)), timeout=15)
+        connection.settimeout(None)
+        connection.sendall(b"D5R1" + struct.pack("!H", len(token)) + token)
+        reply = _recv_exact(connection, 2)
+        if reply != b"OK":
+            connection.close()
+            reason = "busy" if reply == b"BS" else "authentication rejected"
+            raise RuntimeError(f"Windows DLSS relay connection failed: {reason}")
+        return cls(connection)
+
+    def poll(self):
+        return 0 if self._closed else None
+
+    def terminate(self):
+        if not self._closed:
+            self._closed = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.connection.close()
+
+    def finish(self) -> tuple[int, list[str]]:
+        self.stdin.flush()
+        self.connection.shutdown(socket.SHUT_WR)
+        footer = _read_exact(self.stdout, 12)
+        magic, return_code, log_size = struct.unpack("!4siI", footer)
+        if magic != b"D5LF" or log_size > 8 * 1024 * 1024:
+            raise RuntimeError("Invalid response footer from Windows DLSS relay")
+        logs = _read_exact(self.stdout, log_size).decode("utf-8", "replace").splitlines()
+        self._closed = True
+        self.stdout.close()
+        self.stdin.close()
+        self.connection.close()
+        return return_code, logs
+
+
+def _software_process(rgba: np.ndarray, settings: dict) -> np.ndarray:
+    """Portable CPU preview filter. This is intentionally not presented as DLSS."""
+    rgb = rgba[..., :3].astype(np.float32)
+    sigma = 0.8 + float(settings["local_structure"]) * 0.7
+    blurred = cv2.GaussianBlur(rgb, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    amount = 0.18 + float(settings["intensity"]) * 0.22
+    sharpened = cv2.addWeighted(rgb, 1.0 + amount, blurred, -amount, 0)
+    contrast = 1.0 + (float(settings["local_tone"]) - 1.0) * 0.08
+    sharpened = (sharpened - 127.5) * contrast + 127.5
+    result = rgba.copy()
+    result[..., :3] = np.clip(sharpened, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(result)
+
+
 def resolve_size(metadata: dict, options: ConversionOptions) -> tuple[int, int]:
     return int(metadata["width"]), int(metadata["height"])
 
@@ -274,9 +379,22 @@ def _read_exact(stream, size: int) -> bytes:
     return bytes(chunks)
 
 
+def _recv_exact(connection: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        block = connection.recv(size - len(chunks))
+        if not block:
+            raise EOFError("Relay closed during handshake")
+        chunks.extend(block)
+    return bytes(chunks)
+
+
 def _drain_text(stream, lines: list[str]) -> None:
-    for raw in iter(stream.readline, b""):
-        lines.append(raw.decode("utf-8", "replace").rstrip())
+    try:
+        for raw in iter(stream.readline, b""):
+            lines.append(raw.decode("utf-8", "replace").rstrip())
+    finally:
+        stream.close()
 
 
 def _encoder_probe(codec: str) -> bool:
@@ -359,14 +477,14 @@ def compute_video_metrics(source_path: str | os.PathLike[str], output_path: str 
             ):
                 if index % step != 0:
                     continue
-                src = src_frame.to_ndarray(format="rgb")
-                out = out_frame.to_ndarray(format="rgb")
+                src = src_frame.to_ndarray(format="rgb24")
+                out = out_frame.to_ndarray(format="rgb24")
                 if src.shape != out.shape:
                     out = cv2.resize(out, (src.shape[1], src.shape[0]), interpolation=cv2.INTER_LANCZOS4)
                 src_f = src.astype(np.float64) / 255.0
                 out_f = out.astype(np.float64) / 255.0
                 mse = float(np.mean((src_f - out_f) ** 2))
-                psnr = float("inf") if mse == 0.0 else 20.0 * np.log10(255.0 / np.sqrt(mse))
+                psnr = float("inf") if mse == 0.0 else 20.0 * np.log10(1.0 / np.sqrt(mse))
                 mu_a = src_f.mean()
                 mu_b = out_f.mean()
                 var_a = src_f.var()
@@ -404,7 +522,10 @@ def convert_video(
         raise FileNotFoundError(source)
     if options.preserve_hdr:
         raise RuntimeError("HDR preservation is disabled in this build because the verified DLSSNR path is RGBA8. HDR input is converted to SDR instead of being mislabeled as HDR.")
-    required = [FFMPEG, FFPROBE, WORKER, RUNTIME / "nvngx_dlssnr.dll"]
+    backend = resolve_backend()
+    required = [FFMPEG, FFPROBE]
+    if backend == "dlss":
+        required.extend([WORKER, RUNTIME / "nvngx_dlssnr.dll"])
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise RuntimeError("Portable runtime is incomplete:\n" + "\n".join(missing))
@@ -420,9 +541,17 @@ def convert_video(
         if progress:
             progress(0.0, "Анализ видео: декодирование кадров (ffprobe)...")
         metadata = probe_video(source)
-        gpu = detect_gpu()
+        gpu = detect_gpu() if backend == "dlss" else {
+            "name": "Windows DLSS relay" if backend == "relay" else "Portable CPU software backend",
+            "driver": "n/a",
+            "memory_mb": 0,
+            "compute_capability": "n/a",
+            "generation": 0,
+            "beta": False,
+        }
         if progress:
-            progress(0.005, f"Видео: {metadata['width']}x{metadata['height']}, {metadata['frames']} кадров — запуск feature 18...")
+            label = "feature 18" if backend in {"dlss", "relay"} else "portable software preview (not DLSS)"
+            progress(0.005, f"Видео: {metadata['width']}x{metadata['height']}, {metadata['frames']} кадров — запуск {label}...")
         width, height = resolve_size(metadata, options)
         OUTPUTS.mkdir(exist_ok=True)
         JOBS.mkdir(exist_ok=True)
@@ -430,7 +559,8 @@ def convert_video(
         job_dir = JOBS / f"{source.stem}-{stamp}-{os.getpid()}"
         job_dir.mkdir(parents=True, exist_ok=False)
         extension = ".mkv" if options.container == "MKV" else ".mp4"
-        output = OUTPUTS / f"{source.stem}_DLSS5_{stamp}{extension}"
+        output_marker = "DLSS5" if backend in {"dlss", "relay"} else "SOFTWARE"
+        output = OUTPUTS / f"{source.stem}_{output_marker}_{stamp}{extension}"
         ORIGINALS.mkdir(exist_ok=True)
         original_path = ORIGINALS / f"{source.stem}_ORIGINAL_{stamp}{source.suffix}"
         shutil.copy2(source, original_path)
@@ -448,25 +578,31 @@ def convert_video(
             native["local_structure"] = options.local_structure
         if options.skin_structure is not None:
             native["skin_structure"] = options.skin_structure
-        if progress:
-            progress(0.01, f"Starting feature 18 on {gpu['name']}")
-
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        worker = subprocess.Popen(
-            [str(WORKER), "--video"], cwd=RUNTIME, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, creationflags=creation_flags,
-        )
-        controller.register(worker)
         worker_logs: list[str] = []
-        worker_thread = threading.Thread(target=_drain_text, args=(worker.stderr, worker_logs), daemon=True)
-        worker_thread.start()
-        header = struct.pack(
-            "<10I4f", VIDEO_MAGIC, width, height, int(options.warmup_frames), int(metadata["frames"]),
-            native["profile"], native["preset"], native["style"], native["auto_mask"], native["ui_correction"],
-            native["intensity"], native["local_tone"], native["local_structure"], native["skin_structure"],
-        )
-        worker.stdin.write(header)
-        worker.stdin.flush()
+        worker = None
+        worker_thread = None
+        if backend in {"dlss", "relay"}:
+            if progress:
+                progress(0.01, f"Starting feature 18 on {gpu['name']}")
+            if backend == "relay":
+                worker = RelayWorker.connect()
+            else:
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                worker = subprocess.Popen(
+                    [str(WORKER), "--video"], cwd=RUNTIME, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, creationflags=creation_flags,
+                )
+            controller.register(worker)
+            if backend == "dlss":
+                worker_thread = threading.Thread(target=_drain_text, args=(worker.stderr, worker_logs), daemon=True)
+                worker_thread.start()
+            header = struct.pack(
+                "<10I4f", VIDEO_MAGIC, width, height, int(options.warmup_frames), int(metadata["frames"]),
+                native["profile"], native["preset"], native["style"], native["auto_mask"], native["ui_correction"],
+                native["intensity"], native["local_tone"], native["local_structure"], native["skin_structure"],
+            )
+            worker.stdin.write(header)
+            worker.stdin.flush()
 
         encoder, encoder_thread, encoder_logs, selected_encoder = _start_encoder(temp_video, options, controller)
         nut = av.open(encoder.stdin, mode="w", format="nut")
@@ -479,7 +615,7 @@ def convert_video(
         raw_stream.height = height
         raw_stream.pix_fmt = "rgba"
         raw_stream.time_base = input_stream.time_base or metadata["time_base"]
-        guides = TemporalGuideGenerator(width, height)
+        guides = TemporalGuideGenerator(width, height) if backend in {"dlss", "relay"} else None
         delivered = 0
         scene_resets = 0
         for index, frame in enumerate(input_container.decode(input_stream)):
@@ -490,22 +626,25 @@ def convert_video(
             if rgba.shape[1] != width or rgba.shape[0] != height:
                 rgba = _resize_fit(rgba, width, height)
             rgba = np.ascontiguousarray(rgba, dtype=np.uint8)
-            guide = guides.process(rgba)
-            scene_resets += int(guide.reset and index != 0)
             pts = int(frame.pts if frame.pts is not None else index)
-            frame_header = struct.pack("<4Iq", FRAME_MAGIC, index, int(guide.reset), 0, pts)
-            worker.stdin.write(frame_header)
-            worker.stdin.write(rgba.tobytes())
-            worker.stdin.write(guide.motion.tobytes())
-            worker.stdin.flush()
-
-            result_header = _read_exact(worker.stdout, struct.calcsize("<5Iq"))
-            magic, out_index, ok, byte_count, ngx_result, out_pts = struct.unpack("<5Iq", result_header)
-            if magic != OUT_MAGIC or not ok or out_index != index or byte_count != width * height * 4:
-                raise RuntimeError(f"Invalid native worker response for frame {index}")
-            if ngx_result != 1:
-                raise RuntimeError(f"Direct feature-18 evaluation failed on frame {index}: 0x{ngx_result:08X}")
-            processed = np.frombuffer(_read_exact(worker.stdout, byte_count), dtype=np.uint8).reshape(height, width, 4)
+            if backend in {"dlss", "relay"}:
+                guide = guides.process(rgba)
+                scene_resets += int(guide.reset and index != 0)
+                frame_header = struct.pack("<4Iq", FRAME_MAGIC, index, int(guide.reset), 0, pts)
+                worker.stdin.write(frame_header)
+                worker.stdin.write(rgba.tobytes())
+                worker.stdin.write(guide.motion.tobytes())
+                worker.stdin.flush()
+                result_header = _read_exact(worker.stdout, struct.calcsize("<5Iq"))
+                magic, out_index, ok, byte_count, ngx_result, out_pts = struct.unpack("<5Iq", result_header)
+                if magic != OUT_MAGIC or not ok or out_index != index or byte_count != width * height * 4:
+                    raise RuntimeError(f"Invalid native worker response for frame {index}")
+                if ngx_result != 1:
+                    raise RuntimeError(f"Direct feature-18 evaluation failed on frame {index}: 0x{ngx_result:08X}")
+                processed = np.frombuffer(_read_exact(worker.stdout, byte_count), dtype=np.uint8).reshape(height, width, 4)
+            else:
+                processed = _software_process(rgba, native)
+                out_pts = pts
             out_frame = av.VideoFrame.from_ndarray(processed, format="rgba")
             out_frame.pts = out_pts
             out_frame.time_base = input_stream.time_base or metadata["time_base"]
@@ -513,7 +652,8 @@ def convert_video(
                 nut.mux(packet)
             delivered += 1
             if progress:
-                progress(0.04 + 0.84 * delivered / metadata["frames"], f"DLSS 5 frame {delivered}/{metadata['frames']}")
+                frame_label = "DLSS 5" if backend in {"dlss", "relay"} else "Software"
+                progress(0.04 + 0.84 * delivered / metadata["frames"], f"{frame_label} frame {delivered}/{metadata['frames']}")
 
         if delivered != metadata["frames"]:
             raise RuntimeError(f"Decoded {delivered} frames but probe reported {metadata['frames']}; refusing an incomplete render.")
@@ -523,23 +663,29 @@ def convert_video(
         if encoder.stdin and not encoder.stdin.closed:
             encoder.stdin.close()
         input_container.close()
-        worker.stdin.close()
-        worker_code = worker.wait(timeout=60)
-        worker_thread.join(timeout=2)
-        controller.unregister(worker)
+        if worker is not None:
+            if backend == "relay":
+                worker_code, worker_logs = worker.finish()
+            else:
+                worker.stdin.close()
+                worker_code = worker.wait(timeout=60)
+                worker_thread.join(timeout=2)
+            controller.unregister(worker)
+            if worker_code:
+                raise RuntimeError("Native DLSS worker failed:\n" + "\n".join(worker_logs[-40:]))
         encoder_code = encoder.wait(timeout=120)
         encoder_thread.join(timeout=2)
         controller.unregister(encoder)
-        if worker_code:
-            raise RuntimeError("Native DLSS worker failed:\n" + "\n".join(worker_logs[-40:]))
         if encoder_code:
             raise RuntimeError("Video encoder failed:\n" + "\n".join(encoder_logs[-40:]))
 
-        nr_count = delivered
-        create_matches = re.findall(r"direct feature 18 ready:.*result=0x([0-9A-Fa-f]{8})", "\n".join(worker_logs))
-        if not create_matches:
-            raise RuntimeError("Direct feature-18 creation result was not reported; refusing unverifiable output.")
-        direct_create_result = f"0x{create_matches[-1].upper()}"
+        nr_count = delivered if backend in {"dlss", "relay"} else 0
+        direct_create_result = None
+        if backend in {"dlss", "relay"}:
+            create_matches = re.findall(r"direct feature 18 ready:.*result=0x([0-9A-Fa-f]{8})", "\n".join(worker_logs))
+            if not create_matches:
+                raise RuntimeError("Direct feature-18 creation result was not reported; refusing unverifiable output.")
+            direct_create_result = f"0x{create_matches[-1].upper()}"
         if progress:
             progress(0.91, "Muxing original audio and metadata")
         _final_mux(temp_video, source, output, options)
@@ -562,15 +708,15 @@ def convert_video(
             "encoder": selected_encoder,
             "frames_processed": delivered,
             "scene_resets": scene_resets,
-            "pipeline": "direct-dlssnr-feature18",
-            "feature_id": 18,
-            "feature_18_confirmed": True,
+            "backend": backend,
+            "pipeline": "direct-dlssnr-feature18" if backend == "dlss" else ("windows-relay-dlssnr-feature18" if backend == "relay" else "portable-cpu-software-preview"),
+            "feature_id": 18 if backend in {"dlss", "relay"} else None,
+            "feature_18_confirmed": backend in {"dlss", "relay"},
             "direct_create_result": direct_create_result,
             "successful_direct_evaluations": nr_count,
-            "model_sha256": hashlib.sha256((RUNTIME / "nvngx_dlssnr.dll").read_bytes()).hexdigest(),
-            "worker_sha256": hashlib.sha256(WORKER.read_bytes()).hexdigest(),
-            "loaded_module_inventory": ["nvngx.dll (standalone worker image)", "nvngx_dlssnr.dll", "system D3D12/DXGI/NGX core"],
-            "carrier_modules_absent": {"nvngx_dlss.dll": True, "ReShade": True, "RenoDX": True},
+            "model_sha256": hashlib.sha256((RUNTIME / "nvngx_dlssnr.dll").read_bytes()).hexdigest() if backend == "dlss" else None,
+            "worker_sha256": hashlib.sha256(WORKER.read_bytes()).hexdigest() if backend == "dlss" else None,
+            "runtime_location": "windows-relay" if backend == "relay" else "local",
             "native_settings": native,
             "elapsed_seconds": elapsed,
             "average_fps": delivered / elapsed,
@@ -580,8 +726,9 @@ def convert_video(
         report_path = output.with_suffix(output.suffix + ".report.json")
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         if progress:
-            progress(1.0, "Complete — feature 18 confirmed")
-        return ConversionResult(str(output), str(report_path), delivered, nr_count, elapsed, gpu["name"])
+            message = "Complete — feature 18 confirmed" if backend in {"dlss", "relay"} else "Complete — software preview (not DLSS)"
+            progress(1.0, message)
+        return ConversionResult(str(output), str(report_path), delivered, nr_count, elapsed, gpu["name"], backend)
     except Exception as exc:
         was_cancelled = controller.cancel.is_set()
         controller.stop()

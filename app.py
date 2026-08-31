@@ -33,11 +33,14 @@ from dlss5_converter.core import (
     cancel_active_job,
     convert_video,
     detect_gpu,
+    resolve_backend,
 )
 
 WORK = ROOT / "_work"
 WORK.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
+MAX_UPLOAD_BYTES = int(os.environ.get("DLSS5_MAX_UPLOAD_BYTES", str(20 * 1024**3)))
+ALLOWED_INPUT_SUFFIXES = {".mp4", ".mkv", ".webm"}
 
 # ── Состояние рендера ──
 STATE_LOCK = threading.Lock()
@@ -78,11 +81,18 @@ def _run_render(input_path: str, options: ConversionOptions):
                        "frames": result.frames,
                        "elapsed": result.elapsed_seconds,
                        "gpu": result.gpu,
+                       "backend": result.backend,
                    })
     except Exception as exc:
         _set_state(done=True, ok=False, error=str(exc), message="Ошибка")
     finally:
         _set_state(running=False)
+        try:
+            staged = Path(input_path).resolve()
+            if staged.is_relative_to(WORK.resolve()):
+                staged.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ── HTML (стиль NR Media UI) ──
@@ -514,6 +524,7 @@ body[data-theme="light"] .compare-btn { color: #fff; }
 <script>
 const $ = id => document.getElementById(id);
 let currentFile = null;
+const esc = value => String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 
 // ── Диагностика: любая JS-ошибка видна в статус-баре ──
 window.addEventListener('error', e => {
@@ -527,7 +538,9 @@ window.addEventListener('unhandledrejection', e => {
 
 // ── GPU-баннер ──
 fetch('/api/gpu').then(r => r.json()).then(d => {
-  $('gpu-badge').textContent = d.ok ? (d.name + ' · ' + d.driver) : ('GPU: ' + (d.error || 'нет'));
+  $('gpu-badge').textContent = d.ok
+    ? (d.backend === 'software' ? 'SOFTWARE CPU · NOT DLSS' : (d.name + ' · ' + d.driver))
+    : ('GPU: ' + (d.error || 'нет'));
 }).catch(() => {});
 
 // ── Drop-зона ──
@@ -543,7 +556,7 @@ document.addEventListener('drop', e => {
 function setFile(f) {
   currentFile = f;
   $('fileinfo').style.display = 'block';
-  $('fileinfo').innerHTML = '<b>' + f.name + '</b> · ' + (f.size/1048576).toFixed(1) + ' MB';
+  $('fileinfo').innerHTML = '<b>' + esc(f.name) + '</b> · ' + (f.size/1048576).toFixed(1) + ' MB';
   $('preview').style.display = 'none';
   $('render').disabled = false;
   $('status').textContent = t('statusReady') + ': ' + f.name;
@@ -578,11 +591,14 @@ $('render').addEventListener('click', async () => {
   $('error').style.display = 'none'; $('metrics').innerHTML = '';
   $('progress').style.display = 'block'; $('bar').style.width = '0%';
   $('status').textContent = t('statusUpload');
-  const fd = new FormData();
-  fd.append('file', currentFile);
   uploadAbort = new AbortController();
   try {
-    const up = await fetch('/api/upload', { method: 'POST', body: fd, signal: uploadAbort.signal });
+    const up = await fetch('/api/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(currentFile.name) },
+      body: currentFile,
+      signal: uploadAbort.signal
+    });
     const upj = await up.json();
     if (!upj.ok) throw new Error(upj.error || 'upload failed');
     $('status').textContent = t('statusStart');
@@ -677,10 +693,10 @@ function loadResults() {
     box.innerHTML = d.items.map(it => {
       const name = it.name.replace(/_DLSS5_.*[.](mp4|mkv)$/i, '');
       return '<div class="result-item">' +
-        '<div><div class="r-name">' + it.name + '</div>' +
+        '<div><div class="r-name">' + esc(it.name) + '</div>' +
         '<div class="r-meta">' + (it.size/1048576).toFixed(1) + ' MB · ' + it.time + '</div></div>' +
         '<div class="r-actions">' +
-        '<button class="cmp" onclick="openCompare(' + String.fromCharCode(39) + encodeURIComponent(it.name) + String.fromCharCode(39) + ')" title="' + t('compare') + '">◑</button>' +
+        (it.name.includes('_DLSS5_') ? '<button class="cmp" onclick="openCompare(' + String.fromCharCode(39) + encodeURIComponent(it.name) + String.fromCharCode(39) + ')" title="' + t('compare') + '">◑</button>' : '') +
         '<a class="dl" href="/outputs/' + encodeURIComponent(it.name) + '" download>' + t('download') + '</a>' +
         (it.report ? '<a href="/outputs/' + encodeURIComponent(it.report) + '" download>' + t('json') + '</a>' : '') +
         '</div></div>';
@@ -736,9 +752,9 @@ function t(k) { return (I18N[lang] || I18N.ru)[k] || k; }
 function translateStatus(msg) {
   if (lang !== 'en' || !msg) return msg;
   const map = [
-    [/Анализ видео: декодирование кадров \(ffprobe\)\.\.\./, 'Analyzing video: decoding frames (ffprobe)...'],
-    [/Видео: (\d+)x(\d+), (\d+) кадров — запуск feature 18\.\.\./, 'Video: $1x$2, $3 frames — starting feature 18...'],
-    [/кадров за ([\d.]+)s на /, 'frames in $1s on '],
+    [/Анализ видео: декодирование кадров \\(ffprobe\\)\\.\\.\\./, 'Analyzing video: decoding frames (ffprobe)...'],
+    [/Видео: (\\d+)x(\\d+), (\\d+) кадров — запуск feature 18\\.\\.\\./, 'Video: $1x$2, $3 frames — starting feature 18...'],
+    [/кадров за ([\\d.]+)s на /, 'frames in $1s on '],
   ];
   for (const [re, to] of map) {
     if (re.test(msg)) return msg.replace(re, to);
@@ -923,6 +939,13 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, json.dumps(obj, ensure_ascii=False))
 
+    def _origin_allowed(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = self.headers.get("Host", "127.0.0.1:7860")
+        return origin in {f"http://{host}", f"https://{host}"}
+
     def _serve_video(self, target, ctype):
         """Отдача видео с поддержкой Range-запросов (обязательно для <video> стриминга:
         без неё браузер качает файл целиком, seek невозможен, compare виснет)."""
@@ -979,8 +1002,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, HTML, "text/html")
         elif parsed.path == "/api/gpu":
             try:
-                g = detect_gpu()
-                self._json(200, {"ok": True, "name": g["name"], "driver": g["driver"]})
+                backend = resolve_backend()
+                if backend == "software":
+                    self._json(200, {"ok": True, "backend": backend, "name": "Portable CPU", "driver": "n/a"})
+                elif backend == "relay":
+                    self._json(200, {"ok": True, "backend": backend, "name": "Windows DLSS relay", "driver": "remote"})
+                else:
+                    g = detect_gpu()
+                    self._json(200, {"ok": True, "backend": backend, "name": g["name"], "driver": g["driver"]})
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
         elif parsed.path == "/api/status":
@@ -1052,14 +1081,14 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path.startswith("/outputs/"):
             name = urllib.parse.unquote(parsed.path[len("/outputs/"):])
             target = (OUTPUTS / name).resolve()
-            if not str(target).startswith(str(OUTPUTS.resolve())) or not target.is_file():
+            if not target.is_relative_to(OUTPUTS.resolve()) or not target.is_file():
                 self._send(404, "not found", "text/plain")
                 return
             self._serve_video(target, "video/mp4" if target.suffix == ".mp4" else "video/x-matroska")
         elif parsed.path.startswith("/originals/"):
             name = urllib.parse.unquote(parsed.path[len("/originals/"):])
             target = (ORIGINALS / name).resolve()
-            if not ORIGINALS.is_dir() or not str(target).startswith(str(ORIGINALS.resolve())) or not target.is_file():
+            if not ORIGINALS.is_dir() or not target.is_relative_to(ORIGINALS.resolve()) or not target.is_file():
                 self._send(404, "not found", "text/plain")
                 return
             if target.suffix.lower() == ".mkv":
@@ -1074,33 +1103,38 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if not self._origin_allowed():
+            self._json(403, {"ok": False, "error": "cross-origin request rejected"})
+            return
         if parsed.path == "/api/upload":
-            length = int(self.headers.get("Content-Length", 0))
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._json(400, {"ok": False, "error": "invalid content length"})
+                return
             if length <= 0:
                 self._json(400, {"ok": False, "error": "empty upload"})
                 return
-            # multipart/form-data
-            ctype = self.headers.get("Content-Type", "")
-            boundary = ctype.split("boundary=")[-1].strip().strip('"').encode()
-            data = self.rfile.read(length)
-            parts = data.split(b"--" + boundary)
-            payload = None
-            fname = None
-            for part in parts:
-                if b"filename=" in part[:2000]:
-                    head, _, body = part.partition(b"\r\n\r\n")
-                    body = body.rsplit(b"\r\n", 1)[0]
-                    fname = head.split(b'filename="')[1].split(b'"')[0].decode("utf-8", "replace")
-                    payload = body
-                    break
-            if payload is None or not fname:
-                self._json(400, {"ok": False, "error": "no file part"})
+            if length > MAX_UPLOAD_BYTES:
+                self._json(413, {"ok": False, "error": "upload exceeds configured size limit"})
                 return
+            fname = urllib.parse.unquote(self.headers.get("X-Filename", ""))
             safe = os.path.basename(fname)
+            if not safe or Path(safe).suffix.lower() not in ALLOWED_INPUT_SUFFIXES:
+                self._json(400, {"ok": False, "error": "unsupported or missing filename"})
+                return
             dest = WORK / (uuid.uuid4().hex[:8] + "_" + safe)
             with open(dest, "wb") as fh:
-                fh.write(payload)
-            self._json(200, {"ok": True, "path": str(dest), "size": len(payload)})
+                remaining = length
+                while remaining:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        dest.unlink(missing_ok=True)
+                        self._json(400, {"ok": False, "error": "incomplete upload"})
+                        return
+                    fh.write(chunk)
+                    remaining -= len(chunk)
+            self._json(200, {"ok": True, "path": str(dest), "size": length})
         elif parsed.path == "/api/render":
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode("utf-8"))
@@ -1108,7 +1142,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": "bad json"})
                 return
             src = Path(body.get("path", ""))
-            if not src.is_file():
+            try:
+                allowed_source = src.resolve().is_relative_to(WORK.resolve())
+            except OSError:
+                allowed_source = False
+            if not allowed_source or not src.is_file() or src.suffix.lower() not in ALLOWED_INPUT_SUFFIXES:
                 self._json(400, {"ok": False, "error": "file not found"})
                 return
             st = _get_state()
@@ -1143,14 +1181,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    port = 7860
+    host = os.environ.get("DLSS5_HOST", "127.0.0.1")
+    port = int(os.environ.get("DLSS5_PORT", "7860"))
     try:
-        print(f"* DLSS 5 Video Converter - http://127.0.0.1:{port}")
+        print(f"* DLSS 5 Video Converter - http://{host}:{port}")
     except Exception:
         pass  # windowed exe: stdout может быть None или cp1251 без юникода
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = ThreadingHTTPServer((host, port), Handler)
     # Авто-открытие браузера (как в NR Media UI) — с задержкой, чтобы сервер успел подняться
-    threading.Timer(0.8, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
+    if os.environ.get("DLSS5_OPEN_BROWSER", "1") == "1":
+        threading.Timer(0.8, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased] — Docker / Linux / WSL fork
+
+- Added a portable Linux CPU backend whose output and reports are explicitly
+  labeled as software rather than DLSS.
+- Added an authenticated Windows relay for using the D3D12 feature-18 worker
+  from a WSL/Linux Docker container.
+- Added Docker, Compose, relay override, persistent data directories, health
+  checks, and CI image tests.
+- Replaced whole-file uploads with bounded streaming uploads and restricted
+  render jobs to staged media files.
+- Added same-origin POST protection, safer file rendering, staging cleanup, and
+  robust output path containment.
+- Fixed PSNR scaling, PyAV RGB format selection, and process stream cleanup.
+
 Все изменения ниже фиксируют состояние репозитория **до** сборки exe
 (`build_exe.bat`) и публикации GitHub-релиза. Дата фиксации: 2026-08-31.
 

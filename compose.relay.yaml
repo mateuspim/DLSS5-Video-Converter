@@ -1,0 +1,8 @@
+services:
+  converter:
+    environment:
+      DLSS5_BACKEND: relay
+      DLSS5_RELAY_URL: ${DLSS5_RELAY_URL:-host.docker.internal:17861}
+      DLSS5_RELAY_TOKEN: ${DLSS5_RELAY_TOKEN:?Set DLSS5_RELAY_TOKEN}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

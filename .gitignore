@@ -13,5 +13,14 @@ __pycache__/
 build/
 dist/
 
+# Docker runtime data
+data/*/*
+!data/
+!data/jobs/
+!data/outputs/
+!data/originals/
+!data/work/
+!data/*/.gitkeep
+
 # ── Runtime assets (bundled by build_exe.bat, not source) ──
 bin/

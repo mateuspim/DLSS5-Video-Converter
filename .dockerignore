@@ -1,0 +1,13 @@
+.git
+.github
+__pycache__
+*.pyc
+_work
+jobs
+outputs
+originals
+data
+bin
+build
+dist
+native
