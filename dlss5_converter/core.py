@@ -123,19 +123,21 @@ def cancel_active_job() -> str:
 
 
 def _run_json(command: list[str]) -> dict:
-    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Media probe failed")
     return json.loads(result.stdout)
 
 
 def probe_video(path: str | os.PathLike[str]) -> dict:
+    # Быстрый анализ: сначала метаданные (мгновенно), -count_frames (декодирует ВСЕ кадры)
+    # только если nb_frames не указан — иначе 4K-файл на 10+ минут «висит» на анализе.
     data = _run_json(
         [
             str(FFPROBE),
             "-v",
             "error",
-            "-count_frames",
             "-select_streams",
             "v:0",
             "-show_entries",
@@ -160,6 +162,24 @@ def probe_video(path: str | os.PathLike[str]) -> dict:
     if rotation in (90, 270):
         width, height = height, width
     frames = int(stream.get("nb_read_frames") or stream.get("nb_frames") or 0)
+    if frames <= 0:
+        # Нет точного числа кадров в метаданных — считаем через -count_frames (медленно, но точно)
+        counted = _run_json(
+            [
+                str(FFPROBE),
+                "-v",
+                "error",
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "json",
+                str(path),
+            ]
+        )
+        frames = int((counted.get("streams") or [{}])[0].get("nb_read_frames") or 0)
     if frames <= 0:
         raise ValueError("Could not determine an exact frame count for this video.")
     rate_text = stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "30/1"
@@ -190,7 +210,8 @@ def detect_gpu() -> dict:
         "--format=csv,noheader,nounits",
     ]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError("NVIDIA driver tools are unavailable; an RTX GPU and current driver are required.") from exc
     candidates = []
@@ -263,7 +284,8 @@ def _encoder_probe(codec: str) -> bool:
         str(FFMPEG), "-v", "error", "-f", "lavfi", "-i", "color=size=256x256:rate=1",
         "-frames:v", "1", "-c:v", codec, "-f", "null", "-",
     ]
-    return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
 
 
 def _codec_command(options: ConversionOptions) -> tuple[list[str], str]:
@@ -287,7 +309,8 @@ def _start_encoder(temp_video: Path, options: ConversionOptions, controller: Job
         str(FFMPEG), "-hide_banner", "-loglevel", "warning", "-y", "-f", "nut", "-i", "pipe:0",
         "-map", "0:v:0", "-an", *codec_args, "-fps_mode", "passthrough", str(temp_video),
     ]
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     controller.register(process)
     logs: list[str] = []
     thread = threading.Thread(target=_drain_text, args=(process.stderr, logs), daemon=True)
@@ -311,7 +334,8 @@ def _final_mux(temp_video: Path, source: Path, output: Path, options: Conversion
         str(FFMPEG), "-hide_banner", "-loglevel", "warning", "-y", "-i", str(temp_video), "-i", str(source),
         *maps, "-map_metadata", "1", "-map_chapters", "1", *streams, *extra, str(output),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode:
         raise RuntimeError("Final audio/metadata mux failed:\n" + result.stderr[-4000:])
 

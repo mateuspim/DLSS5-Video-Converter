@@ -571,6 +571,7 @@ $('profile').addEventListener('change', () => {
 });
 
 // ── Рендер ──
+let uploadAbort = null;
 $('render').addEventListener('click', async () => {
   if (!currentFile) return;
   $('render').disabled = true; $('stop').disabled = false;
@@ -579,8 +580,9 @@ $('render').addEventListener('click', async () => {
   $('status').textContent = t('statusUpload');
   const fd = new FormData();
   fd.append('file', currentFile);
+  uploadAbort = new AbortController();
   try {
-    const up = await fetch('/api/upload', { method: 'POST', body: fd });
+    const up = await fetch('/api/upload', { method: 'POST', body: fd, signal: uploadAbort.signal });
     const upj = await up.json();
     if (!upj.ok) throw new Error(upj.error || 'upload failed');
     $('status').textContent = t('statusStart');
@@ -603,7 +605,15 @@ $('render').addEventListener('click', async () => {
     if (!rj.ok) throw new Error(rj.error || 'render start failed');
     poll();
   } catch (e) {
-    fail(e.message);
+    if (e.name === 'AbortError') {
+      // Upload отменён кнопкой Stop — не показываем ошибку
+      $('status').textContent = t('statusStopped');
+      $('render').disabled = !currentFile;
+      $('stop').disabled = true;
+      $('progress').style.display = 'none';
+    } else {
+      fail(e.message);
+    }
   }
 });
 
@@ -611,7 +621,7 @@ function poll() {
   fetch('/api/status').then(r => r.json()).then(s => {
     if (s.running) {
       $('bar').style.width = Math.round(s.progress * 100) + '%';
-      $('status').textContent = s.message;
+      $('status').textContent = translateStatus(s.message);
       setTimeout(poll, 500);
     } else if (s.done) {
       $('progress').style.display = 'none';
@@ -622,12 +632,22 @@ function poll() {
           '<div class="metric">frames <b>' + s.result.frames + '</b></div>' +
           '<div class="metric">time <b>' + s.result.elapsed.toFixed(1) + 's</b></div>' +
           '<div class="metric">gpu <b>' + s.result.gpu + '</b></div>';
-        $('preview').src = '/outputs/' + encodeURIComponent(s.result.output.split(/[\\\\/]/).pop());
+        $('preview').src = '/outputs/' + encodeURIComponent(s.result.output.split(/[\\/]/).pop());
         $('preview').style.display = 'block';
         loadResults();
+      } else if (s.error) {
+        fail(s.error);
       } else {
-        fail(s.error || 'unknown error');
+        // Отменено пользователем (cancel) — без ошибки
+        $('status').textContent = t('statusStopped');
+        $('render').disabled = !currentFile;
       }
+    } else {
+      // Не running и не done — рендер отменён/сброшен: приводим UI в порядок
+      $('progress').style.display = 'none';
+      $('stop').disabled = true;
+      $('render').disabled = !currentFile;
+      $('status').textContent = t('statusStopped');
     }
   }).catch(() => setTimeout(poll, 1000));
 }
@@ -641,6 +661,9 @@ function fail(msg) {
 }
 
 $('stop').addEventListener('click', () => {
+  // Отменяем upload, если он идёт (рендер ещё не стартовал)
+  if (uploadAbort) { uploadAbort.abort(); uploadAbort = null; }
+  // Отменяем рендер, если он идёт
   fetch('/api/cancel', { method: 'POST' });
   $('stop').disabled = true;
   $('status').textContent = t('statusStop');
@@ -681,7 +704,7 @@ const I18N = {
     quality: 'Качество', codec: 'Кодек', container: 'Контейнер',
     statusWait: 'Ожидание файла', statusReady: 'Файл выбран — жми Render',
     statusUpload: 'Загрузка файла...', statusStart: 'Запуск рендера...',
-    statusDone: 'Готово', statusError: 'Ошибка', statusStop: 'Остановка...',
+    statusDone: 'Готово', statusError: 'Ошибка', statusStop: 'Остановка...', statusStopped: 'Остановлено',
     download: 'Скачать', compare: 'Сравнить', json: 'JSON',
     compareDone: 'Сравнить ДО/ПОСЛЕ', compareBefore: 'ДО', compareAfter: 'ПОСЛЕ NR',
     compareNotFound: 'Оригинал не найден для этого рендера', comparePlay: 'Пуск', comparePause: 'Пауза',
@@ -697,7 +720,7 @@ const I18N = {
     quality: 'Quality', codec: 'Codec', container: 'Container',
     statusWait: 'Waiting for a file', statusReady: 'File selected — hit Render',
     statusUpload: 'Uploading...', statusStart: 'Starting render...',
-    statusDone: 'Done', statusError: 'Error', statusStop: 'Stopping...',
+    statusDone: 'Done', statusError: 'Error', statusStop: 'Stopping...', statusStopped: 'Stopped',
     download: 'Download', compare: 'Compare', json: 'JSON',
     compareDone: 'Compare BEFORE/AFTER', compareBefore: 'BEFORE', compareAfter: 'AFTER NR',
     compareNotFound: 'No original found for this render', comparePlay: 'Play', comparePause: 'Pause',
@@ -709,6 +732,19 @@ function lsGet(k, d) { try { const v = localStorage.getItem(k); return v === nul
 function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 lang = lsGet('dlss5v_lang', 'ru');
 function t(k) { return (I18N[lang] || I18N.ru)[k] || k; }
+// Статусы из core.py приходят на русском — переводим, если UI на EN
+function translateStatus(msg) {
+  if (lang !== 'en' || !msg) return msg;
+  const map = [
+    [/Анализ видео: декодирование кадров \(ffprobe\)\.\.\./, 'Analyzing video: decoding frames (ffprobe)...'],
+    [/Видео: (\d+)x(\d+), (\d+) кадров — запуск feature 18\.\.\./, 'Video: $1x$2, $3 frames — starting feature 18...'],
+    [/кадров за ([\d.]+)s на /, 'frames in $1s on '],
+  ];
+  for (const [re, to] of map) {
+    if (re.test(msg)) return msg.replace(re, to);
+  }
+  return msg;
+}
 function applyLang() {
   const t = I18N[lang] || I18N.ru;
   document.querySelectorAll('[data-i18n]').forEach(el => {
@@ -748,22 +784,31 @@ function cmpTimer() {
   }
 }
 function syncOthers(src, cur) {
-  if (!cmpState) return;
-  [cmpState.v1, cmpState.v2].forEach(v => {
-    if (v && v !== src && isFinite(v.duration) && v.duration > 0) {
-      v.currentTime = Math.min(cur, v.duration);
-    }
-  });
+  // Мастер-ведомый: синхронизирует ТОЛЬКО v1 (оригинал, muted).
+  // v2 (результат, звук) следует за мастером, но НЕ синхронизирует обратно —
+  // иначе timeupdate обоих создаёт бесконечную петлю (дёрганье, хрип, зависание).
+  if (!cmpState || src !== cmpState.v1) return;
+  const other = cmpState.v2;
+  if (!other || !isFinite(other.duration) || other.duration <= 0) return;
+  const drift = Math.abs(other.currentTime - cur);
+  if (drift > 0.25) { // порог: не дёргаем на каждом тике, только при реальном расхождении
+    other.currentTime = Math.min(cur, other.duration);
+  }
 }
 function syncPlay(v) { if (cmpState) [cmpState.v1, cmpState.v2].forEach(x => { if (x && x !== v) x.play().catch(() => {}); }); }
 function syncPause(v) { if (cmpState) [cmpState.v1, cmpState.v2].forEach(x => { if (x && x !== v) x.pause(); }); }
 function closeCompare() {
+  // Скрываем ОБА: и оверлей (blur-подложка), и модалку — иначе после закрытия
+  // страница остаётся в блюре и «висит»
+  const ov = $('compare-overlay');
+  if (ov) ov.style.display = 'none';
+  const modal = $('compare-modal');
+  if (modal) modal.style.display = 'none';
   if (!cmpState) return;
   clearInterval(cmpState.timer);
   cmpState.v1.removeAttribute('src'); cmpState.v1.load();
   cmpState.v2.removeAttribute('src'); cmpState.v2.load();
   cmpState = null;
-  $('compare-modal').style.display = 'none';
 }
 function openCompare(enc) {
   const name = decodeURIComponent(enc);
@@ -878,6 +923,56 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, json.dumps(obj, ensure_ascii=False))
 
+    def _serve_video(self, target, ctype):
+        """Отдача видео с поддержкой Range-запросов (обязательно для <video> стриминга:
+        без неё браузер качает файл целиком, seek невозможен, compare виснет)."""
+        size = target.stat().st_size
+        range_header = self.headers.get("Range")
+        if range_header:
+            try:
+                # Формат: bytes=start-end или bytes=start-
+                spec = range_header.strip().split("=")[1]
+                start_s, _, end_s = spec.partition("-")
+                start = int(start_s) if start_s else 0
+                end = int(end_s) if end_s else size - 1
+                if start < 0 or end >= size or start > end:
+                    raise ValueError
+            except Exception:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            length = end - start + 1
+            self.send_response(206)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            with open(target, "rb") as fh:
+                fh.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = fh.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except (ConnectionResetError, BrokenPipeError):
+                        break  # браузер закрыл соединение (seek/перемотка) — не роняем сервер
+                    remaining -= len(chunk)
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            with open(target, "rb") as fh:
+                try:
+                    shutil.copyfileobj(fh, self.wfile)
+                except (ConnectionResetError, BrokenPipeError):
+                    pass  # браузер закрыл соединение — не роняем сервер
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
@@ -960,13 +1055,7 @@ class Handler(BaseHTTPRequestHandler):
             if not str(target).startswith(str(OUTPUTS.resolve())) or not target.is_file():
                 self._send(404, "not found", "text/plain")
                 return
-            self.send_response(200)
-            self.send_header("Content-Type", "video/mp4" if target.suffix == ".mp4" else "video/x-matroska")
-            self.send_header("Content-Length", str(target.stat().st_size))
-            self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
-            self.end_headers()
-            with open(target, "rb") as fh:
-                shutil.copyfileobj(fh, self.wfile)
+            self._serve_video(target, "video/mp4" if target.suffix == ".mp4" else "video/x-matroska")
         elif parsed.path.startswith("/originals/"):
             name = urllib.parse.unquote(parsed.path[len("/originals/"):])
             target = (ORIGINALS / name).resolve()
@@ -979,12 +1068,7 @@ class Handler(BaseHTTPRequestHandler):
                 ctype = "video/webm"
             else:
                 ctype = "video/mp4"
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(target.stat().st_size))
-            self.end_headers()
-            with open(target, "rb") as fh:
-                shutil.copyfileobj(fh, self.wfile)
+            self._serve_video(target, ctype)
         else:
             self._send(404, "not found", "text/plain")
 
