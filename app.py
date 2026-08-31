@@ -958,7 +958,7 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     try:
                         self.wfile.write(chunk)
-                    except (ConnectionResetError, BrokenPipeError):
+                    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
                         break  # браузер закрыл соединение (seek/перемотка) — не роняем сервер
                     remaining -= len(chunk)
         else:
@@ -970,7 +970,7 @@ class Handler(BaseHTTPRequestHandler):
             with open(target, "rb") as fh:
                 try:
                     shutil.copyfileobj(fh, self.wfile)
-                except (ConnectionResetError, BrokenPipeError):
+                except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
                     pass  # браузер закрыл соединение — не роняем сервер
 
     def do_GET(self):
