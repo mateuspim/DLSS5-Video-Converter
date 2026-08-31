@@ -2,15 +2,31 @@
 
 ## What works
 
-The container runs the web UI, video and static-image decoding, portable CPU
-preview filter, FFmpeg encoding, audio/metadata muxing, result verification,
-and reports on Linux, Docker Desktop, and WSL 2. PNG, JPEG, and WebP inputs
-produce lossless PNG outputs.
+The container runs the web UI, video and static-image decoding, portable CPU or
+OpenCL GPU preview filter, FFmpeg encoding, audio/metadata muxing, result
+verification, and reports on Linux, Docker Desktop, and WSL 2. PNG, JPEG, and
+WebP inputs produce lossless PNG outputs.
 
-The portable backend is **not NVIDIA DLSS**. Its files contain `_SOFTWARE_`,
-and its reports set `feature_18_confirmed` to `false`. The upstream feature-18
-worker is a Windows D3D12 executable that loads a Windows DLL; Linux containers
-cannot execute it through the NVIDIA Container Toolkit.
+The portable backends are **not NVIDIA DLSS**. Their files contain `_SOFTWARE_`
+or `_GPU_`, and their reports set `feature_18_confirmed` to `false`. The
+upstream feature-18 worker is a Windows D3D12 executable that loads a Windows
+DLL; Linux containers cannot execute it through the NVIDIA Container Toolkit.
+
+## Use the NVIDIA GPU on Linux
+
+Install and configure the NVIDIA Container Toolkit for Docker, then start the
+OpenCL GPU override:
+
+```bash
+docker compose -f compose.yaml -f compose.gpu.yaml up --build
+```
+
+This selects `DLSS5_BACKEND=gpu`, requests the NVIDIA GPU from Docker, and
+forces OpenCV's Transparent API to select an NVIDIA OpenCL GPU. It refuses to
+start if OpenCL would fall back to the CPU. Results contain `_GPU_`, use the
+`portable-opencl-gpu-preview` pipeline label, and still set
+`feature_18_confirmed` to `false` because this is GPU acceleration for the
+portable filter—not the Windows DLSS model.
 
 ## Build the Windows worker from Linux or WSL
 
@@ -60,7 +76,7 @@ performance than `/mnt/c`.
 - `DLSS5_MAX_UPLOAD_BYTES`: upload limit, default 20 GiB.
 - `DLSS5_MAX_IMAGE_BYTES`: compressed image limit, default 256 MiB.
 - `DLSS5_MAX_IMAGE_PIXELS`: decoded image limit, default 100 megapixels.
-- `DLSS5_BACKEND`: `software`, `relay`, `dlss`, or `auto`. The Docker image
+- `DLSS5_BACKEND`: `software`, `gpu`, `relay`, `dlss`, or `auto`. The Docker image
   defaults to `software`; selecting local `dlss` in Linux fails explicitly.
 
 ## Actual DLSS feature 18

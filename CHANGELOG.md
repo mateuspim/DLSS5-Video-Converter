@@ -12,6 +12,8 @@
   Windows GitHub runner and downloads the resulting artifact on Linux or WSL.
 - Added PNG, JPEG, and WebP input with lossless PNG output, image previews, and
   support across the software, Windows relay, and direct DLSS backends.
+- Added an NVIDIA OpenCL Docker override for GPU-accelerated portable filtering
+  with strict no-CPU-fallback checks and explicit non-DLSS result labels.
 - Replaced whole-file uploads with bounded streaming uploads and restricted
   render jobs to staged media files.
 - Added same-origin POST protection, safer file rendering, staging cleanup, and

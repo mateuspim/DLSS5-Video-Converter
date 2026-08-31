@@ -43,6 +43,21 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(result.dtype, np.uint8)
         np.testing.assert_array_equal(result[..., 3], frame[..., 3])
 
+    def test_explicit_gpu_backend_requires_and_reports_opencl_gpu(self):
+        gpu = {
+            "name": "Mock RTX OpenCL",
+            "driver": "test",
+            "vendor": "NVIDIA",
+            "memory_mb": 1024,
+            "compute_capability": "OpenCL C 3.0",
+            "generation": 0,
+            "beta": False,
+        }
+        with patch.dict(os.environ, {"DLSS5_BACKEND": "gpu"}), patch.object(
+            core, "opencl_gpu_info", return_value=gpu
+        ):
+            self.assertEqual(core.resolve_backend(), "gpu")
+
     def test_image_conversion_writes_lossless_png_and_report(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -70,6 +85,31 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(report["media_type"], "image")
             self.assertFalse(report["feature_18_confirmed"])
             self.assertEqual(report["encoder"], "png-lossless")
+
+    def test_gpu_image_conversion_is_labeled_not_dlss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "input.png"
+            rgba = np.full((48, 64, 4), 127, dtype=np.uint8)
+            rgba[..., 3] = 255
+            core._write_png(source, rgba)
+            gpu = {
+                "name": "Mock RTX OpenCL", "driver": "test", "vendor": "NVIDIA",
+                "memory_mb": 1024, "compute_capability": "OpenCL C 3.0", "generation": 0, "beta": False,
+            }
+            with patch.dict(os.environ, {"DLSS5_BACKEND": "gpu"}), patch.multiple(
+                core,
+                OUTPUTS=base / "outputs",
+                ORIGINALS=base / "originals",
+            ), patch.object(core, "opencl_gpu_info", return_value=gpu), patch.object(
+                core, "_gpu_process", side_effect=lambda image, settings: image.copy()
+            ):
+                result = core.convert_image(source)
+            report = json.loads(Path(result.report_path).read_text())
+            self.assertEqual(result.backend, "gpu")
+            self.assertIn("_GPU_", Path(result.output_path).name)
+            self.assertEqual(report["pipeline"], "portable-opencl-gpu-preview")
+            self.assertFalse(report["feature_18_confirmed"])
 
 
 if __name__ == "__main__":

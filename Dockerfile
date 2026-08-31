@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DLSS5_BACKEND=software
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ffmpeg libglib2.0-0 \
+    && apt-get install --no-install-recommends -y ffmpeg libglib2.0-0 ocl-icd-libopencl1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -5,9 +5,9 @@ Local web tool that runs videos and static images through **NVIDIA DLSS 5 Neural
 > **Experimental.** This is a research build that calls the DLSS Neural Rendering model directly, outside of a game engine. Read the [Limitations](#limitations) section before using it.
 
 > **Linux / WSL / Docker fork:** the portable container uses an explicitly
-> labeled CPU software-preview backend. It does not claim to run DLSS feature
-> 18. See [DOCKER.md](DOCKER.md) for the compatibility boundary and startup
-> instructions.
+> labeled CPU or OpenCL GPU preview backend. Neither claims to run DLSS feature
+> 18. See [DOCKER.md](DOCKER.md) for GPU startup, the compatibility boundary,
+> and Windows-relay instructions.
 
 ---
 

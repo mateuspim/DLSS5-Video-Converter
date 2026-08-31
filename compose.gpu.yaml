@@ -1,0 +1,7 @@
+services:
+  converter:
+    environment:
+      DLSS5_BACKEND: gpu
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      OPENCV_OPENCL_DEVICE: "NVIDIA:GPU:"
+    gpus: all

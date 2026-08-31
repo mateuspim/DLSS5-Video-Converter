@@ -35,6 +35,7 @@ from dlss5_converter.core import (
     cancel_active_job,
     convert_media,
     detect_gpu,
+    opencl_gpu_info,
     resolve_backend,
 )
 
@@ -553,7 +554,7 @@ window.addEventListener('unhandledrejection', e => {
 // ── GPU-баннер ──
 fetch('/api/gpu').then(r => r.json()).then(d => {
   $('gpu-badge').textContent = d.ok
-    ? (d.backend === 'software' ? 'SOFTWARE CPU · NOT DLSS' : (d.name + ' · ' + d.driver))
+    ? (d.backend === 'software' ? 'SOFTWARE CPU · NOT DLSS' : (d.backend === 'gpu' ? 'GPU OPENCL · NOT DLSS · ' + d.name : (d.name + ' · ' + d.driver)))
     : ('GPU: ' + (d.error || 'нет'));
 }).catch(() => {});
 
@@ -1034,6 +1035,9 @@ class Handler(BaseHTTPRequestHandler):
                 backend = resolve_backend()
                 if backend == "software":
                     self._json(200, {"ok": True, "backend": backend, "name": "Portable CPU", "driver": "n/a"})
+                elif backend == "gpu":
+                    g = opencl_gpu_info()
+                    self._json(200, {"ok": True, "backend": backend, "name": g["name"], "driver": g["driver"]})
                 elif backend == "relay":
                     self._json(200, {"ok": True, "backend": backend, "name": "Windows DLSS relay", "driver": "remote"})
                 else:
@@ -1206,6 +1210,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True})
         elif parsed.path == "/api/clear":
             for f in OUTPUTS.iterdir():
+                if f.name == ".gitkeep":
+                    continue
                 try:
                     f.unlink()
                 except OSError:
@@ -1218,8 +1224,9 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     host = os.environ.get("DLSS5_HOST", "127.0.0.1")
     port = int(os.environ.get("DLSS5_PORT", "7860"))
+    backend = resolve_backend()
     try:
-        print(f"* DLSS 5 Video Converter - http://{host}:{port}")
+        print(f"* DLSS 5 Media Converter ({backend}) - http://{host}:{port}")
     except Exception:
         pass  # windowed exe: stdout может быть None или cp1251 без юникода
     server = ThreadingHTTPServer((host, port), Handler)

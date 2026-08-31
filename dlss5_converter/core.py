@@ -258,8 +258,8 @@ def detect_gpu() -> dict:
 def resolve_backend() -> str:
     """Select an explicit backend without ever mislabeling software output as DLSS."""
     requested = os.environ.get("DLSS5_BACKEND", "auto").strip().lower()
-    if requested not in {"auto", "dlss", "relay", "software"}:
-        raise RuntimeError("DLSS5_BACKEND must be one of: auto, dlss, relay, software")
+    if requested not in {"auto", "dlss", "relay", "gpu", "software"}:
+        raise RuntimeError("DLSS5_BACKEND must be one of: auto, dlss, relay, gpu, software")
     runtime_ready = os.name == "nt" and WORKER.is_file() and (RUNTIME / "nvngx_dlssnr.dll").is_file()
     if requested == "auto":
         if os.environ.get("DLSS5_RELAY_URL"):
@@ -273,6 +273,8 @@ def resolve_backend() -> str:
     if requested == "relay":
         if not os.environ.get("DLSS5_RELAY_URL") or not os.environ.get("DLSS5_RELAY_TOKEN"):
             raise RuntimeError("The relay backend requires DLSS5_RELAY_URL and DLSS5_RELAY_TOKEN")
+    if requested == "gpu":
+        opencl_gpu_info()
     return requested
 
 
@@ -345,6 +347,50 @@ def _software_process(rgba: np.ndarray, settings: dict) -> np.ndarray:
     return np.ascontiguousarray(result)
 
 
+def opencl_gpu_info() -> dict:
+    if not cv2.ocl.haveOpenCL():
+        raise RuntimeError(
+            "The GPU preview backend requires an OpenCL runtime inside the container. "
+            "Install NVIDIA Container Toolkit and start with compose.gpu.yaml."
+        )
+    cv2.ocl.setUseOpenCL(True)
+    # Force creation of the OpenCL context before querying its default device.
+    cv2.add(cv2.UMat(np.zeros((2, 2), dtype=np.uint8)), 1).get()
+    if not cv2.ocl.useOpenCL():
+        raise RuntimeError("OpenCV found OpenCL but could not activate an OpenCL device.")
+    device = cv2.ocl.Device_getDefault()
+    device_type = int(device.type())
+    gpu_type = int(getattr(cv2.ocl, "Device_TYPE_GPU", 4))
+    if not device.available() or not (device_type & gpu_type):
+        raise RuntimeError("The selected OpenCL device is not a GPU; refusing a silent CPU fallback.")
+    return {
+        "name": device.name() or "OpenCL GPU",
+        "driver": device.driverVersion() or "OpenCL",
+        "vendor": device.vendorName() or "unknown",
+        "memory_mb": int(device.globalMemSize()) // (1024 * 1024),
+        "compute_capability": device.OpenCL_C_Version() or "OpenCL",
+        "generation": 0,
+        "beta": False,
+    }
+
+
+def _gpu_process(rgba: np.ndarray, settings: dict) -> np.ndarray:
+    """OpenCL T-API implementation of the portable preview filter."""
+    if not cv2.ocl.useOpenCL():
+        opencl_gpu_info()
+    rgb = cv2.UMat(rgba[..., :3].astype(np.float32))
+    sigma = 0.8 + float(settings["local_structure"]) * 0.7
+    blurred = cv2.GaussianBlur(rgb, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    amount = 0.18 + float(settings["intensity"]) * 0.22
+    sharpened = cv2.addWeighted(rgb, 1.0 + amount, blurred, -amount, 0)
+    contrast = 1.0 + (float(settings["local_tone"]) - 1.0) * 0.08
+    adjusted = cv2.addWeighted(sharpened, contrast, sharpened, 0.0, 127.5 * (1.0 - contrast))
+    cv2.ocl.finish()
+    result = rgba.copy()
+    result[..., :3] = np.clip(adjusted.get(), 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(result)
+
+
 def _native_settings(options: ConversionOptions) -> dict:
     settings = PROFILES.get(options.profile)
     if settings is None:
@@ -363,6 +409,8 @@ def _native_settings(options: ConversionOptions) -> dict:
 def _backend_gpu(backend: str) -> dict:
     if backend == "dlss":
         return detect_gpu()
+    if backend == "gpu":
+        return opencl_gpu_info()
     return {
         "name": "Windows DLSS relay" if backend == "relay" else "Portable CPU software backend",
         "driver": "n/a",
@@ -371,6 +419,15 @@ def _backend_gpu(backend: str) -> dict:
         "generation": 0,
         "beta": False,
     }
+
+
+def _pipeline_name(backend: str) -> str:
+    return {
+        "dlss": "direct-dlssnr-feature18",
+        "relay": "windows-relay-dlssnr-feature18",
+        "gpu": "portable-opencl-gpu-preview",
+        "software": "portable-cpu-software-preview",
+    }[backend]
 
 
 def resolve_size(metadata: dict, options: ConversionOptions) -> tuple[int, int]:
@@ -575,7 +632,7 @@ def convert_video(
         metadata = probe_video(source)
         gpu = _backend_gpu(backend)
         if progress:
-            label = "feature 18" if backend in {"dlss", "relay"} else "portable software preview (not DLSS)"
+            label = "feature 18" if backend in {"dlss", "relay"} else ("OpenCL GPU preview (not DLSS)" if backend == "gpu" else "portable software preview (not DLSS)")
             progress(0.005, f"Видео: {metadata['width']}x{metadata['height']}, {metadata['frames']} кадров — запуск {label}...")
         width, height = resolve_size(metadata, options)
         OUTPUTS.mkdir(exist_ok=True)
@@ -584,7 +641,7 @@ def convert_video(
         job_dir = JOBS / f"{source.stem}-{stamp}-{os.getpid()}"
         job_dir.mkdir(parents=True, exist_ok=False)
         extension = ".mkv" if options.container == "MKV" else ".mp4"
-        output_marker = "DLSS5" if backend in {"dlss", "relay"} else "SOFTWARE"
+        output_marker = "DLSS5" if backend in {"dlss", "relay"} else ("GPU" if backend == "gpu" else "SOFTWARE")
         output = OUTPUTS / f"{source.stem}_{output_marker}_{stamp}{extension}"
         ORIGINALS.mkdir(exist_ok=True)
         original_path = ORIGINALS / f"{source.stem}_ORIGINAL_{stamp}{source.suffix}"
@@ -655,6 +712,9 @@ def convert_video(
                 if ngx_result != 1:
                     raise RuntimeError(f"Direct feature-18 evaluation failed on frame {index}: 0x{ngx_result:08X}")
                 processed = np.frombuffer(_read_exact(worker.stdout, byte_count), dtype=np.uint8).reshape(height, width, 4)
+            elif backend == "gpu":
+                processed = _gpu_process(rgba, native)
+                out_pts = pts
             else:
                 processed = _software_process(rgba, native)
                 out_pts = pts
@@ -665,7 +725,7 @@ def convert_video(
                 nut.mux(packet)
             delivered += 1
             if progress:
-                frame_label = "DLSS 5" if backend in {"dlss", "relay"} else "Software"
+                frame_label = "DLSS 5" if backend in {"dlss", "relay"} else ("GPU" if backend == "gpu" else "Software")
                 progress(0.04 + 0.84 * delivered / metadata["frames"], f"{frame_label} frame {delivered}/{metadata['frames']}")
 
         if delivered != metadata["frames"]:
@@ -723,7 +783,7 @@ def convert_video(
             "frames_processed": delivered,
             "scene_resets": scene_resets,
             "backend": backend,
-            "pipeline": "direct-dlssnr-feature18" if backend == "dlss" else ("windows-relay-dlssnr-feature18" if backend == "relay" else "portable-cpu-software-preview"),
+            "pipeline": _pipeline_name(backend),
             "feature_id": 18 if backend in {"dlss", "relay"} else None,
             "feature_18_confirmed": backend in {"dlss", "relay"},
             "direct_create_result": direct_create_result,
@@ -740,7 +800,7 @@ def convert_video(
         report_path = output.with_suffix(output.suffix + ".report.json")
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         if progress:
-            message = "Complete — feature 18 confirmed" if backend in {"dlss", "relay"} else "Complete — software preview (not DLSS)"
+            message = "Complete — feature 18 confirmed" if backend in {"dlss", "relay"} else ("Complete — OpenCL GPU preview (not DLSS)" if backend == "gpu" else "Complete — software preview (not DLSS)")
             progress(1.0, message)
         return ConversionResult(str(output), str(report_path), delivered, nr_count, elapsed, gpu["name"], backend)
     except Exception as exc:
@@ -844,7 +904,7 @@ def convert_image(
         OUTPUTS.mkdir(exist_ok=True)
         ORIGINALS.mkdir(exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
-        output_marker = "DLSS5" if backend in {"dlss", "relay"} else "SOFTWARE"
+        output_marker = "DLSS5" if backend in {"dlss", "relay"} else ("GPU" if backend == "gpu" else "SOFTWARE")
         output = OUTPUTS / f"{source.stem}_{output_marker}_{stamp}.png"
         original_path = ORIGINALS / f"{source.stem}_ORIGINAL_{stamp}{source.suffix.lower()}"
         shutil.copy2(source, original_path)
@@ -896,6 +956,11 @@ def convert_image(
             if not create_matches:
                 raise RuntimeError("Direct feature-18 creation result was not reported; refusing unverifiable output.")
             direct_create_result = f"0x{create_matches[-1].upper()}"
+        elif backend == "gpu":
+            if progress:
+                progress(0.2, "Processing image with OpenCL GPU preview (not DLSS)...")
+            processed = _gpu_process(rgba, settings)
+            direct_create_result = None
         else:
             if progress:
                 progress(0.2, "Processing image with portable software preview (not DLSS)...")
@@ -927,7 +992,7 @@ def convert_image(
             "frames_processed": 1,
             "scene_resets": 0,
             "backend": backend,
-            "pipeline": "direct-dlssnr-feature18" if backend == "dlss" else ("windows-relay-dlssnr-feature18" if backend == "relay" else "portable-cpu-software-preview"),
+            "pipeline": _pipeline_name(backend),
             "feature_id": 18 if backend in {"dlss", "relay"} else None,
             "feature_18_confirmed": backend in {"dlss", "relay"},
             "direct_create_result": direct_create_result,
@@ -942,7 +1007,7 @@ def convert_image(
         report_path = output.with_suffix(output.suffix + ".report.json")
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         if progress:
-            message = "Complete — feature 18 confirmed" if nr_count else "Complete — software preview (not DLSS)"
+            message = "Complete — feature 18 confirmed" if nr_count else ("Complete — OpenCL GPU preview (not DLSS)" if backend == "gpu" else "Complete — software preview (not DLSS)")
             progress(1.0, message)
         return ConversionResult(str(output), str(report_path), 1, nr_count, elapsed, gpu["name"], backend, "image")
     except Exception as exc:
