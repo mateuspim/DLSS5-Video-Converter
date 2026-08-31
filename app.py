@@ -28,10 +28,12 @@ sys.path.insert(0, str(ROOT))
 
 from dlss5_converter.core import (
     ConversionOptions,
+    IMAGE_SUFFIXES,
     ORIGINALS,
     OUTPUTS,
+    VIDEO_SUFFIXES,
     cancel_active_job,
-    convert_video,
+    convert_media,
     detect_gpu,
     resolve_backend,
 )
@@ -40,7 +42,7 @@ WORK = ROOT / "_work"
 WORK.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 MAX_UPLOAD_BYTES = int(os.environ.get("DLSS5_MAX_UPLOAD_BYTES", str(20 * 1024**3)))
-ALLOWED_INPUT_SUFFIXES = {".mp4", ".mkv", ".webm"}
+ALLOWED_INPUT_SUFFIXES = VIDEO_SUFFIXES | IMAGE_SUFFIXES
 
 # ── Состояние рендера ──
 STATE_LOCK = threading.Lock()
@@ -73,7 +75,7 @@ def _run_render(input_path: str, options: ConversionOptions):
         _set_state(progress=value, message=message)
 
     try:
-        result = convert_video(input_path, options, progress=report)
+        result = convert_media(input_path, options, progress=report)
         _set_state(done=True, ok=True, progress=1.0, message="Готово",
                    result={
                        "output": result.output_path,
@@ -82,6 +84,7 @@ def _run_render(input_path: str, options: ConversionOptions):
                        "elapsed": result.elapsed_seconds,
                        "gpu": result.gpu,
                        "backend": result.backend,
+                       "media_type": result.media_type,
                    })
     except Exception as exc:
         _set_state(done=True, ok=False, error=str(exc), message="Ошибка")
@@ -100,7 +103,7 @@ HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>DLSS 5 Neural Rendering — видео</title>
+<title>DLSS 5 Neural Rendering — media</title>
 <style>
 :root {
   --bg: #0a0c10;
@@ -281,7 +284,7 @@ input[type=file] { display: none; }
   background: rgba(248,113,113,.08); border: 1px solid rgba(248,113,113,.25);
   color: var(--danger); font-size: 12px; font-family: var(--mono); white-space: pre-wrap; display: none;
 }
-video.preview { width: 100%; max-height: 52vh; border-radius: var(--radius-sm); margin-top: 14px; display: none; box-shadow: 0 12px 40px rgba(0,0,0,.55); }
+.preview { width: 100%; max-height: 52vh; object-fit: contain; border-radius: var(--radius-sm); margin-top: 14px; display: none; box-shadow: 0 12px 40px rgba(0,0,0,.55); }
 .help-btn {
   display: flex; align-items: center; gap: 6px;
   padding: 8px 14px; border: 1px solid var(--border-strong); border-radius: 999px;
@@ -383,7 +386,7 @@ body[data-theme="light"] .compare-btn { color: #fff; }
       </svg>
     </div>
     <div>
-      <h1>DLSS 5 Video Converter</h1>
+      <h1>DLSS 5 Media Converter</h1>
       <div class="sub">feature 18 · optical flow · NVENC</div>
     </div>
   </div>
@@ -398,7 +401,7 @@ body[data-theme="light"] .compare-btn { color: #fff; }
 <div class="grid">
   <div class="card">
     <div class="drop-title" data-i18n="input">Input</div>
-    <div class="drop-sub" data-i18n="inputSub">видео прогоняется через DLSS 5 Neural Rendering (feature 18)</div>
+    <div class="drop-sub" data-i18n="inputSub">видео или изображение обрабатывается через Neural Rendering</div>
     <div id="drop">
       <div class="drop-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -406,12 +409,13 @@ body[data-theme="light"] .compare-btn { color: #fff; }
           <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
         </svg>
       </div>
-      <div class="drop-label" data-i18n="addVideo">Добавить видео</div>
-      <div class="hint" data-i18n="addHint">mp4 / mkv / webm · клик для выбора</div>
-      <input type="file" id="file" accept="video/*">
+      <div class="drop-label" data-i18n="addMedia">Добавить видео или изображение</div>
+      <div class="hint" data-i18n="addHint">mp4 / mkv / webm / png / jpg / webp · клик для выбора</div>
+      <input type="file" id="file" accept="video/*,image/png,image/jpeg,image/webp">
     </div>
     <div id="fileinfo"></div>
     <video class="preview" id="preview" controls></video>
+    <img class="preview" id="image-preview" alt="Processed image preview">
     <div class="status" id="status" data-i18n="statusWait">Ожидание файла</div>
     <div class="progress" id="progress"><div class="bar" id="bar"></div></div>
     <div class="error-box" id="error"></div>
@@ -435,8 +439,9 @@ body[data-theme="light"] .compare-btn { color: #fff; }
     <input type="range" id="structure" min="0" max="3" step="0.05" value="1.50">
     <label><span data-i18n="skin">Skin Structure</span> <span id="v-skin">1.00</span></label>
     <input type="range" id="skin" min="-1" max="3" step="0.05" value="1.00">
+    <div id="encoding-controls">
     <div class="divider-row"></div>
-    <h2 data-i18n="encoding">Encoding</h2>
+    <h2 data-i18n="encoding">Video Encoding</h2>
     <label><span data-i18n="quality">Качество</span> <span id="q-val">High</span></label>
     <select id="quality">
       <option value="High" selected>High (CRF 17)</option>
@@ -454,10 +459,11 @@ body[data-theme="light"] .compare-btn { color: #fff; }
       <option value="MP4" selected>MP4</option>
       <option value="MKV">MKV</option>
     </select>
+    </div>
     <div class="divider-row"></div>
     <button class="btn" id="render" disabled>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>
-      <span data-i18n="render">Render whole video</span>
+      <span data-i18n="renderMedia">Render media</span>
     </button>
     <div class="row">
       <button class="btn-danger" id="stop" disabled>
@@ -525,6 +531,14 @@ body[data-theme="light"] .compare-btn { color: #fff; }
 const $ = id => document.getElementById(id);
 let currentFile = null;
 const esc = value => String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const IMAGE_EXT = /[.](png|jpe?g|webp)$/i;
+function currentIsImage() { return !!currentFile && IMAGE_EXT.test(currentFile.name); }
+function updateMediaUI() {
+  const image = currentIsImage();
+  $('encoding-controls').style.display = image ? 'none' : 'block';
+  const label = $('render').querySelector('[data-i18n]');
+  if (label) label.textContent = image ? t('renderImage') : (currentFile ? t('renderVideo') : t('renderMedia'));
+}
 
 // ── Диагностика: любая JS-ошибка видна в статус-баре ──
 window.addEventListener('error', e => {
@@ -558,6 +572,10 @@ function setFile(f) {
   $('fileinfo').style.display = 'block';
   $('fileinfo').innerHTML = '<b>' + esc(f.name) + '</b> · ' + (f.size/1048576).toFixed(1) + ' MB';
   $('preview').style.display = 'none';
+  $('preview').removeAttribute('src');
+  $('image-preview').style.display = 'none';
+  $('image-preview').removeAttribute('src');
+  updateMediaUI();
   $('render').disabled = false;
   $('status').textContent = t('statusReady') + ': ' + f.name;
   $('error').style.display = 'none';
@@ -643,13 +661,23 @@ function poll() {
       $('progress').style.display = 'none';
       $('stop').disabled = true;
       if (s.ok) {
-        $('status').textContent = t('statusDone') + ': ' + s.result.frames + ' frames in ' + s.result.elapsed.toFixed(1) + 's on ' + s.result.gpu;
+        const unit = s.result.media_type === 'image' ? t('oneImage') : (s.result.frames + ' frames');
+        $('status').textContent = t('statusDone') + ': ' + unit + ' in ' + s.result.elapsed.toFixed(1) + 's on ' + s.result.gpu;
         $('metrics').innerHTML =
-          '<div class="metric">frames <b>' + s.result.frames + '</b></div>' +
+          '<div class="metric">' + (s.result.media_type === 'image' ? 'images' : 'frames') + ' <b>' + s.result.frames + '</b></div>' +
           '<div class="metric">time <b>' + s.result.elapsed.toFixed(1) + 's</b></div>' +
           '<div class="metric">gpu <b>' + s.result.gpu + '</b></div>';
-        $('preview').src = '/outputs/' + encodeURIComponent(s.result.output.split(/[\\/]/).pop());
-        $('preview').style.display = 'block';
+        const resultUrl = '/outputs/' + encodeURIComponent(s.result.output.split(/[\\/]/).pop());
+        if (s.result.media_type === 'image') {
+          $('preview').style.display = 'none';
+          $('image-preview').src = resultUrl;
+          $('image-preview').style.display = 'block';
+        } else {
+          $('image-preview').style.display = 'none';
+          $('preview').src = resultUrl;
+          $('preview').style.display = 'block';
+        }
+        $('render').disabled = !currentFile;
         loadResults();
       } else if (s.error) {
         fail(s.error);
@@ -696,7 +724,7 @@ function loadResults() {
         '<div><div class="r-name">' + esc(it.name) + '</div>' +
         '<div class="r-meta">' + (it.size/1048576).toFixed(1) + ' MB · ' + it.time + '</div></div>' +
         '<div class="r-actions">' +
-        (it.name.includes('_DLSS5_') ? '<button class="cmp" onclick="openCompare(' + String.fromCharCode(39) + encodeURIComponent(it.name) + String.fromCharCode(39) + ')" title="' + t('compare') + '">◑</button>' : '') +
+        (it.name.includes('_DLSS5_') && /[.](mp4|mkv)$/i.test(it.name) ? '<button class="cmp" onclick="openCompare(' + String.fromCharCode(39) + encodeURIComponent(it.name) + String.fromCharCode(39) + ')" title="' + t('compare') + '">◑</button>' : '') +
         '<a class="dl" href="/outputs/' + encodeURIComponent(it.name) + '" download>' + t('download') + '</a>' +
         (it.report ? '<a href="/outputs/' + encodeURIComponent(it.report) + '" download>' + t('json') + '</a>' : '') +
         '</div></div>';
@@ -711,32 +739,32 @@ loadResults();
 // ── i18n (RU/EN) ──
 const I18N = {
   ru: {
-    addVideo: 'Добавить видео', addHint: 'mp4 / mkv / webm · клик для выбора',
-    input: 'Input', inputSub: 'видео прогоняется через DLSS 5 Neural Rendering (feature 18)',
+    addMedia: 'Добавить видео или изображение', addHint: 'mp4 / mkv / webm / png / jpg / webp · клик для выбора',
+    input: 'Input', inputSub: 'видео или изображение обрабатывается через Neural Rendering',
     results: 'Результаты', emptyResults: 'Пока пусто — рендеры появятся здесь',
-    madeBy: 'Сделано', render: 'Render whole video', stop: 'Stop', clear: 'Очистить',
+    madeBy: 'Сделано', renderMedia: 'Render media', renderVideo: 'Render whole video', renderImage: 'Render image', stop: 'Stop', clear: 'Очистить',
     profile: 'Profile', nrParams: 'NR Parameters', encoding: 'Encoding',
     intensity: 'Intensity', tone: 'Local Tone', structure: 'Local Structure', skin: 'Skin Structure',
     quality: 'Качество', codec: 'Кодек', container: 'Контейнер',
     statusWait: 'Ожидание файла', statusReady: 'Файл выбран — жми Render',
     statusUpload: 'Загрузка файла...', statusStart: 'Запуск рендера...',
-    statusDone: 'Готово', statusError: 'Ошибка', statusStop: 'Остановка...', statusStopped: 'Остановлено',
+    statusDone: 'Готово', oneImage: '1 изображение', statusError: 'Ошибка', statusStop: 'Остановка...', statusStopped: 'Остановлено',
     download: 'Скачать', compare: 'Сравнить', json: 'JSON',
     compareDone: 'Сравнить ДО/ПОСЛЕ', compareBefore: 'ДО', compareAfter: 'ПОСЛЕ NR',
     compareNotFound: 'Оригинал не найден для этого рендера', comparePlay: 'Пуск', comparePause: 'Пауза',
     compareSync: 'Синхронизация недоступна — одно из видео не загрузилось',
   },
   en: {
-    addVideo: 'Add video', addHint: 'mp4 / mkv / webm · click to select',
-    input: 'Input', inputSub: 'video is processed through DLSS 5 Neural Rendering (feature 18)',
+    addMedia: 'Add video or image', addHint: 'mp4 / mkv / webm / png / jpg / webp · click to select',
+    input: 'Input', inputSub: 'video or image is processed through Neural Rendering',
     results: 'Results', emptyResults: 'Nothing here yet — renders will appear',
-    madeBy: 'Made by', render: 'Render whole video', stop: 'Stop', clear: 'Clear',
+    madeBy: 'Made by', renderMedia: 'Render media', renderVideo: 'Render whole video', renderImage: 'Render image', stop: 'Stop', clear: 'Clear',
     profile: 'Profile', nrParams: 'NR Parameters', encoding: 'Encoding',
     intensity: 'Intensity', tone: 'Local Tone', structure: 'Local Structure', skin: 'Skin Structure',
     quality: 'Quality', codec: 'Codec', container: 'Container',
     statusWait: 'Waiting for a file', statusReady: 'File selected — hit Render',
     statusUpload: 'Uploading...', statusStart: 'Starting render...',
-    statusDone: 'Done', statusError: 'Error', statusStop: 'Stopping...', statusStopped: 'Stopped',
+    statusDone: 'Done', oneImage: '1 image', statusError: 'Error', statusStop: 'Stopping...', statusStopped: 'Stopped',
     download: 'Download', compare: 'Compare', json: 'JSON',
     compareDone: 'Compare BEFORE/AFTER', compareBefore: 'BEFORE', compareAfter: 'AFTER NR',
     compareNotFound: 'No original found for this render', comparePlay: 'Play', comparePause: 'Pause',
@@ -769,6 +797,7 @@ function applyLang() {
   });
   $('langBtn').textContent = lang === 'ru' ? 'EN' : 'RU';
   document.documentElement.lang = lang;
+  updateMediaUI();
   if (readmeOpen()) loadReadme();
 }
 function toggleLang() { lang = lang === 'ru' ? 'en' : 'ru'; lsSet('dlss5v_lang', lang); applyLang(); }
@@ -1017,7 +1046,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/results":
             items = []
             for f in sorted(OUTPUTS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-                if f.suffix.lower() in (".mp4", ".mkv"):
+                if f.suffix.lower() in VIDEO_SUFFIXES | {".png"}:
                     report = f.with_name(f.name + ".report.json")
                     items.append({
                         "name": f.name,
@@ -1030,7 +1059,7 @@ class Handler(BaseHTTPRequestHandler):
             items = []
             if ORIGINALS.is_dir():
                 for f in sorted(ORIGINALS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-                    if f.is_file() and f.suffix.lower() in (".mp4", ".mkv", ".webm"):
+                    if f.is_file() and f.suffix.lower() in ALLOWED_INPUT_SUFFIXES:
                         items.append({
                             "name": f.name,
                             "size": f.stat().st_size,
@@ -1084,19 +1113,21 @@ class Handler(BaseHTTPRequestHandler):
             if not target.is_relative_to(OUTPUTS.resolve()) or not target.is_file():
                 self._send(404, "not found", "text/plain")
                 return
-            self._serve_video(target, "video/mp4" if target.suffix == ".mp4" else "video/x-matroska")
+            content_types = {
+                ".mp4": "video/mp4", ".mkv": "video/x-matroska",
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+            }
+            self._serve_video(target, content_types.get(target.suffix.lower(), "application/octet-stream"))
         elif parsed.path.startswith("/originals/"):
             name = urllib.parse.unquote(parsed.path[len("/originals/"):])
             target = (ORIGINALS / name).resolve()
             if not ORIGINALS.is_dir() or not target.is_relative_to(ORIGINALS.resolve()) or not target.is_file():
                 self._send(404, "not found", "text/plain")
                 return
-            if target.suffix.lower() == ".mkv":
-                ctype = "video/x-matroska"
-            elif target.suffix.lower() == ".webm":
-                ctype = "video/webm"
-            else:
-                ctype = "video/mp4"
+            ctype = {
+                ".mp4": "video/mp4", ".mkv": "video/x-matroska", ".webm": "video/webm",
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+            }.get(target.suffix.lower(), "application/octet-stream")
             self._serve_video(target, ctype)
         else:
             self._send(404, "not found", "text/plain")
@@ -1122,6 +1153,10 @@ class Handler(BaseHTTPRequestHandler):
             safe = os.path.basename(fname)
             if not safe or Path(safe).suffix.lower() not in ALLOWED_INPUT_SUFFIXES:
                 self._json(400, {"ok": False, "error": "unsupported or missing filename"})
+                return
+            image_limit = int(os.environ.get("DLSS5_MAX_IMAGE_BYTES", str(256 * 1024**2)))
+            if Path(safe).suffix.lower() in IMAGE_SUFFIXES and length > image_limit:
+                self._json(413, {"ok": False, "error": "image exceeds configured size limit"})
                 return
             dest = WORK / (uuid.uuid4().hex[:8] + "_" + safe)
             with open(dest, "wb") as fh:

@@ -1,6 +1,6 @@
-# DLSS 5 Video Converter
+# DLSS 5 Media Converter
 
-Local web tool that runs video through **NVIDIA DLSS 5 Neural Rendering** (NGX feature 18, `nvngx_dlssnr.dll`) with optical-flow motion vectors and encodes the result with NVENC.
+Local web tool that runs videos and static images through **NVIDIA DLSS 5 Neural Rendering** (NGX feature 18, `nvngx_dlssnr.dll`). Videos use optical-flow motion vectors and NVENC; images are returned as lossless PNG files.
 
 > **Experimental.** This is a research build that calls the DLSS Neural Rendering model directly, outside of a game engine. Read the [Limitations](#limitations) section before using it.
 
@@ -13,10 +13,12 @@ Local web tool that runs video through **NVIDIA DLSS 5 Neural Rendering** (NGX f
 
 ## What it does
 
-1. You drop a video file into the web UI (or pick it with the file dialog).
+1. You drop a video or static image into the web UI (or pick it with the file dialog).
 2. Every frame is decoded, converted to RGBA8, and sent to the DLSS 5 Neural Rendering model (feature 18) together with optical-flow motion vectors estimated from the video itself.
 3. The processed frames are encoded with NVENC (H.264 / HEVC / AV1) and muxed back with the original audio and metadata.
 4. The result lands in `outputs/` next to a JSON report with full pipeline evidence (feature-18 confirmation, per-frame evaluation count, model SHA-256, encoder logs).
+
+For PNG, JPEG, and WebP input, the still image is evaluated as a reset frame with zero motion and written as a lossless PNG. Video encoding settings are hidden for image jobs.
 
 ## Quick start
 
@@ -24,7 +26,7 @@ Local web tool that runs video through **NVIDIA DLSS 5 Neural Rendering** (NGX f
 
 1. Run `start.bat`.
 2. Open **http://127.0.0.1:7860** in your browser.
-3. Drag a video onto the drop zone (or click it), pick a profile and encoding settings, press **Render whole video**.
+3. Drag a video or image onto the drop zone, pick a profile, and press the render button.
 
 The server binds to `127.0.0.1` only — the UI is not exposed to the network.
 
@@ -54,7 +56,7 @@ Four sliders — **Intensity**, **Local Tone**, **Local Structure** (range 0–3
 ### Interface
 
 - RU/EN language toggle, dark/light theme (both remembered between sessions).
-- Drag & drop or "Add video" button; supported input: mp4 / mkv / webm.
+- Drag & drop or file picker; supported input: mp4 / mkv / webm / png / jpg / jpeg / webp.
 - Live progress bar, per-frame status, GPU badge (name + driver version).
 - Results feed with **Download** and **JSON report** buttons, plus an in-page preview of the last render.
 - **Stop** cancels the current render (partial video is removed, diagnostics are kept); **Clear** empties the results feed.

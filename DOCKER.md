@@ -2,9 +2,10 @@
 
 ## What works
 
-The container runs the web UI, video decoding, portable CPU preview filter,
-FFmpeg encoding, audio/metadata muxing, result verification, and reports on
-Linux, Docker Desktop, and WSL 2.
+The container runs the web UI, video and static-image decoding, portable CPU
+preview filter, FFmpeg encoding, audio/metadata muxing, result verification,
+and reports on Linux, Docker Desktop, and WSL 2. PNG, JPEG, and WebP inputs
+produce lossless PNG outputs.
 
 The portable backend is **not NVIDIA DLSS**. Its files contain `_SOFTWARE_`,
 and its reports set `feature_18_confirmed` to `false`. The upstream feature-18
@@ -57,6 +58,8 @@ performance than `/mnt/c`.
 
 - `DLSS5_PORT`: host port, default `7860`.
 - `DLSS5_MAX_UPLOAD_BYTES`: upload limit, default 20 GiB.
+- `DLSS5_MAX_IMAGE_BYTES`: compressed image limit, default 256 MiB.
+- `DLSS5_MAX_IMAGE_PIXELS`: decoded image limit, default 100 megapixels.
 - `DLSS5_BACKEND`: `software`, `relay`, `dlss`, or `auto`. The Docker image
   defaults to `software`; selecting local `dlss` in Linux fails explicitly.
 

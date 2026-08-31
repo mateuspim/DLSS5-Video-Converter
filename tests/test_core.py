@@ -1,5 +1,8 @@
+import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -39,6 +42,34 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(result.shape, frame.shape)
         self.assertEqual(result.dtype, np.uint8)
         np.testing.assert_array_equal(result[..., 3], frame[..., 3])
+
+    def test_image_conversion_writes_lossless_png_and_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "input.png"
+            rgba = np.zeros((48, 64, 4), dtype=np.uint8)
+            rgba[..., 0] = np.arange(64, dtype=np.uint8)[None, :]
+            rgba[..., 1] = np.arange(48, dtype=np.uint8)[:, None]
+            rgba[..., 2] = 120
+            rgba[..., 3] = 173
+            core._write_png(source, rgba)
+            with patch.dict(os.environ, {"DLSS5_BACKEND": "software"}), patch.multiple(
+                core,
+                OUTPUTS=base / "outputs",
+                ORIGINALS=base / "originals",
+            ):
+                result = core.convert_media(source, core.ConversionOptions(profile="Natural"))
+
+            output = Path(result.output_path)
+            decoded = core._decode_image(output)
+            report = json.loads(Path(result.report_path).read_text())
+            self.assertEqual(result.media_type, "image")
+            self.assertEqual(output.suffix, ".png")
+            self.assertEqual(decoded.shape, rgba.shape)
+            np.testing.assert_array_equal(decoded[..., 3], rgba[..., 3])
+            self.assertEqual(report["media_type"], "image")
+            self.assertFalse(report["feature_18_confirmed"])
+            self.assertEqual(report["encoder"], "png-lossless")
 
 
 if __name__ == "__main__":

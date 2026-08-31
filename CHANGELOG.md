@@ -10,6 +10,8 @@
   checks, and CI image tests.
 - Added a shell wrapper that dispatches the MSVC-only Windows worker build to a
   Windows GitHub runner and downloads the resulting artifact on Linux or WSL.
+- Added PNG, JPEG, and WebP input with lossless PNG output, image previews, and
+  support across the software, Windows relay, and direct DLSS backends.
 - Replaced whole-file uploads with bounded streaming uploads and restricted
   render jobs to staged media files.
 - Added same-origin POST protection, safer file rendering, staging cleanup, and

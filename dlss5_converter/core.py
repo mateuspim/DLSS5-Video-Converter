@@ -32,6 +32,9 @@ else:
 ROOT = BASE
 RUNTIME = ROOT / "bin" / "runtime"
 
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".webm"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+
 
 def _media_tool(env_name: str, bundled_name: str, system_name: str) -> Path:
     override = os.environ.get(env_name)
@@ -92,6 +95,7 @@ class ConversionResult:
     elapsed_seconds: float
     gpu: str
     backend: str
+    media_type: str = "video"
 
 
 class Cancelled(RuntimeError):
@@ -134,7 +138,7 @@ def cancel_active_job() -> str:
     if _ACTIVE is None:
         return "No render is running."
     _ACTIVE.stop()
-    return "Stop requested; partial video will be removed and diagnostics retained."
+    return "Stop requested; partial output will be removed and diagnostics retained."
 
 
 def _run_json(command: list[str]) -> dict:
@@ -341,6 +345,34 @@ def _software_process(rgba: np.ndarray, settings: dict) -> np.ndarray:
     return np.ascontiguousarray(result)
 
 
+def _native_settings(options: ConversionOptions) -> dict:
+    settings = PROFILES.get(options.profile)
+    if settings is None:
+        raise RuntimeError(f"Unknown native DLSS 5 profile: {options.profile}")
+    settings = dict(settings)
+    overrides = {
+        "intensity": options.intensity,
+        "local_tone": options.local_tone,
+        "local_structure": options.local_structure,
+        "skin_structure": options.skin_structure,
+    }
+    settings.update({key: value for key, value in overrides.items() if value is not None})
+    return settings
+
+
+def _backend_gpu(backend: str) -> dict:
+    if backend == "dlss":
+        return detect_gpu()
+    return {
+        "name": "Windows DLSS relay" if backend == "relay" else "Portable CPU software backend",
+        "driver": "n/a",
+        "memory_mb": 0,
+        "compute_capability": "n/a",
+        "generation": 0,
+        "beta": False,
+    }
+
+
 def resolve_size(metadata: dict, options: ConversionOptions) -> tuple[int, int]:
     return int(metadata["width"]), int(metadata["height"])
 
@@ -541,14 +573,7 @@ def convert_video(
         if progress:
             progress(0.0, "Анализ видео: декодирование кадров (ffprobe)...")
         metadata = probe_video(source)
-        gpu = detect_gpu() if backend == "dlss" else {
-            "name": "Windows DLSS relay" if backend == "relay" else "Portable CPU software backend",
-            "driver": "n/a",
-            "memory_mb": 0,
-            "compute_capability": "n/a",
-            "generation": 0,
-            "beta": False,
-        }
+        gpu = _backend_gpu(backend)
         if progress:
             label = "feature 18" if backend in {"dlss", "relay"} else "portable software preview (not DLSS)"
             progress(0.005, f"Видео: {metadata['width']}x{metadata['height']}, {metadata['frames']} кадров — запуск {label}...")
@@ -565,19 +590,7 @@ def convert_video(
         original_path = ORIGINALS / f"{source.stem}_ORIGINAL_{stamp}{source.suffix}"
         shutil.copy2(source, original_path)
         temp_video = job_dir / "processed-video.mkv"
-        native = PROFILES.get(options.profile)
-        if native is None:
-            raise RuntimeError(f"Unknown native DLSS 5 profile: {options.profile}")
-        # Кастомные NR-параметры переопределяют профиль
-        native = dict(native)
-        if options.intensity is not None:
-            native["intensity"] = options.intensity
-        if options.local_tone is not None:
-            native["local_tone"] = options.local_tone
-        if options.local_structure is not None:
-            native["local_structure"] = options.local_structure
-        if options.skin_structure is not None:
-            native["skin_structure"] = options.skin_structure
+        native = _native_settings(options)
         worker_logs: list[str] = []
         worker = None
         worker_thread = None
@@ -697,6 +710,7 @@ def convert_video(
         elapsed = time.perf_counter() - started
         report = {
             "status": "success",
+            "media_type": "video",
             "input": str(source),
             "output": str(output),
             "original_path": str(original_path),
@@ -742,3 +756,216 @@ def convert_video(
         _ACTIVE_LOCK.release()
         if job_dir and job_dir.exists():
             shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _decode_image(path: Path) -> np.ndarray:
+    max_bytes = int(os.environ.get("DLSS5_MAX_IMAGE_BYTES", str(256 * 1024**2)))
+    if path.stat().st_size > max_bytes:
+        raise ValueError(f"Image exceeds the configured {max_bytes:,}-byte limit.")
+    encoded = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    image = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+    if image is None or image.size == 0:
+        raise ValueError("The selected file is not a decodable PNG, JPEG, or WebP image.")
+    if image.dtype == np.uint16:
+        image = (image / 257).astype(np.uint8)
+    elif image.dtype != np.uint8:
+        raise ValueError(f"Unsupported image sample type: {image.dtype}")
+    if image.ndim == 2:
+        rgba = cv2.cvtColor(image, cv2.COLOR_GRAY2RGBA)
+    elif image.ndim == 3 and image.shape[2] == 3:
+        rgba = cv2.cvtColor(image, cv2.COLOR_BGR2RGBA)
+    elif image.ndim == 3 and image.shape[2] == 4:
+        rgba = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+    else:
+        raise ValueError("Unsupported image channel layout.")
+    height, width = rgba.shape[:2]
+    max_pixels = int(os.environ.get("DLSS5_MAX_IMAGE_PIXELS", "100000000"))
+    if width * height > max_pixels:
+        raise ValueError(f"Image exceeds the configured {max_pixels:,}-pixel limit.")
+    return np.ascontiguousarray(rgba)
+
+
+def _write_png(path: Path, rgba: np.ndarray) -> None:
+    bgra = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
+    ok, encoded = cv2.imencode(".png", bgra, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    if not ok:
+        raise RuntimeError("OpenCV could not encode the processed image as PNG.")
+    path.write_bytes(encoded.tobytes())
+
+
+def _image_metrics(source: np.ndarray, output: np.ndarray) -> dict:
+    source_rgb = source[..., :3].astype(np.float64) / 255.0
+    output_rgb = output[..., :3].astype(np.float64) / 255.0
+    mse = float(np.mean((source_rgb - output_rgb) ** 2))
+    psnr = float("inf") if mse == 0.0 else 20.0 * np.log10(1.0 / np.sqrt(mse))
+    return {
+        "psnr": None if not np.isfinite(psnr) else round(psnr, 2),
+        "mean_absolute_change": round(float(np.mean(np.abs(source_rgb - output_rgb))), 6),
+    }
+
+
+def convert_image(
+    input_path: str | os.PathLike[str],
+    options: ConversionOptions | None = None,
+    progress: Callable[[float, str], None] | None = None,
+) -> ConversionResult:
+    """Process a static image and emit a lossless PNG result."""
+    global _ACTIVE
+    options = options or ConversionOptions()
+    source = Path(input_path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    if source.suffix.lower() not in IMAGE_SUFFIXES:
+        raise ValueError("Image input must be PNG, JPEG, or WebP.")
+    backend = resolve_backend()
+    if backend == "dlss":
+        missing = [str(path) for path in (WORKER, RUNTIME / "nvngx_dlssnr.dll") if not path.exists()]
+        if missing:
+            raise RuntimeError("Portable runtime is incomplete:\n" + "\n".join(missing))
+
+    controller = JobController()
+    if not _ACTIVE_LOCK.acquire(blocking=False):
+        raise RuntimeError("Another GPU render is already running.")
+    _ACTIVE = controller
+    started = time.perf_counter()
+    output: Path | None = None
+    worker = None
+    worker_thread = None
+    worker_logs: list[str] = []
+    try:
+        if progress:
+            progress(0.0, "Decoding image...")
+        rgba = _decode_image(source)
+        height, width = rgba.shape[:2]
+        if backend in {"dlss", "relay"} and (width < 64 or height < 64 or width > 7680 or height > 4320):
+            raise ValueError("DLSS image dimensions must be between 64x64 and 7680x4320.")
+        gpu = _backend_gpu(backend)
+        settings = _native_settings(options)
+        OUTPUTS.mkdir(exist_ok=True)
+        ORIGINALS.mkdir(exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
+        output_marker = "DLSS5" if backend in {"dlss", "relay"} else "SOFTWARE"
+        output = OUTPUTS / f"{source.stem}_{output_marker}_{stamp}.png"
+        original_path = ORIGINALS / f"{source.stem}_ORIGINAL_{stamp}{source.suffix.lower()}"
+        shutil.copy2(source, original_path)
+
+        if controller.cancel.is_set():
+            raise Cancelled("Render stopped by user.")
+        if backend in {"dlss", "relay"}:
+            if progress:
+                progress(0.1, f"Starting feature 18 on {gpu['name']}")
+            if backend == "relay":
+                worker = RelayWorker.connect()
+            else:
+                worker = subprocess.Popen(
+                    [str(WORKER), "--video"], cwd=RUNTIME, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            controller.register(worker)
+            if backend == "dlss":
+                worker_thread = threading.Thread(target=_drain_text, args=(worker.stderr, worker_logs), daemon=True)
+                worker_thread.start()
+            header = struct.pack(
+                "<10I4f", VIDEO_MAGIC, width, height, int(options.warmup_frames), 1,
+                settings["profile"], settings["preset"], settings["style"], settings["auto_mask"], settings["ui_correction"],
+                settings["intensity"], settings["local_tone"], settings["local_structure"], settings["skin_structure"],
+            )
+            motion = np.zeros((height, width, 2), dtype=np.float16)
+            worker.stdin.write(header)
+            worker.stdin.write(struct.pack("<4Iq", FRAME_MAGIC, 0, 1, 0, 0))
+            worker.stdin.write(rgba.tobytes())
+            worker.stdin.write(motion.tobytes())
+            worker.stdin.flush()
+            result_header = _read_exact(worker.stdout, struct.calcsize("<5Iq"))
+            magic, out_index, ok, byte_count, ngx_result, _ = struct.unpack("<5Iq", result_header)
+            if magic != OUT_MAGIC or not ok or out_index != 0 or byte_count != width * height * 4:
+                raise RuntimeError("Invalid native worker response for image")
+            if ngx_result != 1:
+                raise RuntimeError(f"Direct feature-18 image evaluation failed: 0x{ngx_result:08X}")
+            processed = np.frombuffer(_read_exact(worker.stdout, byte_count), dtype=np.uint8).reshape(height, width, 4).copy()
+            if backend == "relay":
+                worker_code, worker_logs = worker.finish()
+            else:
+                worker.stdin.close()
+                worker_code = worker.wait(timeout=60)
+                worker_thread.join(timeout=2)
+            controller.unregister(worker)
+            if worker_code:
+                raise RuntimeError("Native DLSS worker failed:\n" + "\n".join(worker_logs[-40:]))
+            create_matches = re.findall(r"direct feature 18 ready:.*result=0x([0-9A-Fa-f]{8})", "\n".join(worker_logs))
+            if not create_matches:
+                raise RuntimeError("Direct feature-18 creation result was not reported; refusing unverifiable output.")
+            direct_create_result = f"0x{create_matches[-1].upper()}"
+        else:
+            if progress:
+                progress(0.2, "Processing image with portable software preview (not DLSS)...")
+            processed = _software_process(rgba, settings)
+            direct_create_result = None
+
+        if controller.cancel.is_set():
+            raise Cancelled("Render stopped by user.")
+        if progress:
+            progress(0.9, "Writing lossless PNG...")
+        _write_png(output, processed)
+        verified = _decode_image(output)
+        if verified.shape != processed.shape:
+            raise RuntimeError("Output image verification found unexpected dimensions or channels.")
+        elapsed = time.perf_counter() - started
+        nr_count = 1 if backend in {"dlss", "relay"} else 0
+        report = {
+            "status": "success",
+            "media_type": "image",
+            "input": str(source),
+            "output": str(output),
+            "original_path": str(original_path),
+            "metrics": _image_metrics(rgba, verified),
+            "options": asdict(options),
+            "input_metadata": {"width": width, "height": height, "channels": 4, "format": source.suffix.lower().lstrip(".")},
+            "output_metadata": {"width": width, "height": height, "channels": 4, "format": "png"},
+            "gpu": gpu,
+            "encoder": "png-lossless",
+            "frames_processed": 1,
+            "scene_resets": 0,
+            "backend": backend,
+            "pipeline": "direct-dlssnr-feature18" if backend == "dlss" else ("windows-relay-dlssnr-feature18" if backend == "relay" else "portable-cpu-software-preview"),
+            "feature_id": 18 if backend in {"dlss", "relay"} else None,
+            "feature_18_confirmed": backend in {"dlss", "relay"},
+            "direct_create_result": direct_create_result,
+            "successful_direct_evaluations": nr_count,
+            "model_sha256": hashlib.sha256((RUNTIME / "nvngx_dlssnr.dll").read_bytes()).hexdigest() if backend == "dlss" else None,
+            "worker_sha256": hashlib.sha256(WORKER.read_bytes()).hexdigest() if backend == "dlss" else None,
+            "runtime_location": "windows-relay" if backend == "relay" else "local",
+            "native_settings": settings,
+            "elapsed_seconds": elapsed,
+            "worker_log": worker_logs,
+        }
+        report_path = output.with_suffix(output.suffix + ".report.json")
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        if progress:
+            message = "Complete — feature 18 confirmed" if nr_count else "Complete — software preview (not DLSS)"
+            progress(1.0, message)
+        return ConversionResult(str(output), str(report_path), 1, nr_count, elapsed, gpu["name"], backend, "image")
+    except Exception as exc:
+        was_cancelled = controller.cancel.is_set()
+        controller.stop()
+        if output and output.exists():
+            output.unlink()
+        if was_cancelled and not isinstance(exc, Cancelled):
+            raise Cancelled("Render stopped by user.") from exc
+        raise
+    finally:
+        _ACTIVE = None
+        _ACTIVE_LOCK.release()
+
+
+def convert_media(
+    input_path: str | os.PathLike[str],
+    options: ConversionOptions | None = None,
+    progress: Callable[[float, str], None] | None = None,
+) -> ConversionResult:
+    suffix = Path(input_path).suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        return convert_image(input_path, options, progress)
+    if suffix in VIDEO_SUFFIXES:
+        return convert_video(input_path, options, progress)
+    raise ValueError("Supported inputs are MP4, MKV, WebM, PNG, JPEG, and WebP.")
