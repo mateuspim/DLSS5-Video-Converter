@@ -1,0 +1,17 @@
+# ── Runtime data (created by the app / converted videos) ──
+_work/
+jobs/
+outputs/
+originals/
+
+# ── Python ──
+__pycache__/
+*.pyc
+
+# ── PyInstaller build artifacts ──
+*.spec
+build/
+dist/
+
+# ── Runtime assets (bundled by build_exe.bat, not source) ──
+bin/
