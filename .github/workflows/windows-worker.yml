@@ -1,0 +1,37 @@
+name: Windows worker
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - docker-linux-wsl
+    paths:
+      - native/**
+      - .github/workflows/windows-worker.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build with MSVC
+        shell: cmd
+        run: native\build_native.bat
+      - name: Verify worker image
+        shell: pwsh
+        run: |
+          $path = "bin/runtime/nvngx.dll"
+          if (-not (Test-Path $path)) { throw "Worker was not produced" }
+          $magic = [System.IO.File]::ReadAllBytes($path)[0..1]
+          if ($magic[0] -ne 0x4d -or $magic[1] -ne 0x5a) { throw "Worker is not a Windows PE image" }
+          Get-Item $path | Format-List Name,Length
+          Get-FileHash $path -Algorithm SHA256
+      - name: Upload Windows worker
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvngx-windows-worker
+          path: bin/runtime/nvngx.dll
+          if-no-files-found: error

@@ -8,8 +8,8 @@
   from a WSL/Linux Docker container.
 - Added Docker, Compose, relay override, persistent data directories, health
   checks, and CI image tests.
-- Added a pinned llvm-mingw container and shell wrapper for cross-building the
-  Windows D3D12 worker from Linux or WSL.
+- Added a shell wrapper that dispatches the MSVC-only Windows worker build to a
+  Windows GitHub runner and downloads the resulting artifact on Linux or WSL.
 - Replaced whole-file uploads with bounded streaming uploads and restricted
   render jobs to staged media files.
 - Added same-origin POST protection, safer file rendering, staging cleanup, and

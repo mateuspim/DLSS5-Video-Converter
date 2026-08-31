@@ -11,11 +11,12 @@ and its reports set `feature_18_confirmed` to `false`. The upstream feature-18
 worker is a Windows D3D12 executable that loads a Windows DLL; Linux containers
 cannot execute it through the NVIDIA Container Toolkit.
 
-## Build the Windows worker from Linux
+## Build the Windows worker from Linux or WSL
 
-The worker is C++, but it uses the Windows ABI, D3D12 headers, and NVIDIA's
-Windows library. The included wrapper builds it in a pinned llvm-mingw
-cross-compilation container:
+The worker is C++, but NVIDIA's supplied library contains MSVC C++ ABI objects;
+an ordinary Linux cross-compiler cannot link it without Microsoft's proprietary
+toolchain libraries. The included wrapper dispatches an MSVC build to the
+fork's Windows GitHub runner and downloads the resulting artifact:
 
 ```bash
 ./scripts/build-windows-worker.sh
@@ -25,6 +26,10 @@ The result is `bin/runtime/nvngx.dll`. Despite its extension, it is a Windows
 console executable whose filename intentionally satisfies the model's caller
 check. It cannot execute inside the Linux container; copy it and the patched
 `nvngx_dlssnr.dll` to the Windows-side `bin/runtime` directory.
+
+The wrapper requires an authenticated [GitHub CLI](https://cli.github.com/).
+Override `DLSS5_GITHUB_REPOSITORY` and `DLSS5_GITHUB_BRANCH` when building from
+another fork or branch.
 
 ## Start
 
