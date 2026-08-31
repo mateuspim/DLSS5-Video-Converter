@@ -472,6 +472,45 @@ body[data-theme="light"] .compare-btn { color: #fff; }
   <a class="footer-link" href="https://youtube.com/@perseval_BLR" target="_blank" rel="noopener">youtube.com/@perseval_BLR</a>
 </footer>
 
+
+<!-- README modal -->
+<div class="modal-overlay" id="readme-modal" onclick="if (event.target === this) closeReadme()">
+  <div class="modal">
+    <div class="modal-head">
+      <span>README</span>
+      <button class="help-btn modal-close" onclick="closeReadme()" title="Close">×</button>
+    </div>
+    <pre id="readme-content" style="white-space:pre-wrap; font-family:var(--mono); font-size:12.5px; color:var(--text-2); line-height:1.6"></pre>
+  </div>
+</div>
+
+<!-- Compare ДО/ПОСЛЕ modal -->
+<div class="compare-overlay" id="compare-overlay" onclick="if (event.target === this) closeCompare()">
+  <div class="compare-modal" id="compare-modal">
+    <div class="compare-head">
+      <span class="c-title" id="c-title"></span>
+      <span class="c-time" id="c-time">0:00 / 0:00</span>
+      <span style="display:flex;gap:10px;align-items:center;">
+        <button class="compare-btn" id="c-btn">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          <span id="c-btn-label" data-i18n="comparePlay">Пуск</span>
+        </button>
+        <button class="help-btn modal-close" onclick="closeCompare()" title="Close">×</button>
+      </span>
+    </div>
+    <div class="compare-grid">
+      <div class="compare-col">
+        <div class="compare-lbl"><b data-i18n="compareBefore">ДО</b> · <span id="c-name-1"></span></div>
+        <video class="compare-video" id="cmp-video-1" muted playsinline></video>
+      </div>
+      <div class="compare-col">
+        <div class="compare-lbl"><b data-i18n="compareAfter">ПОСЛЕ NR</b> · <span id="c-name-2"></span></div>
+        <video class="compare-video" id="cmp-video-2" playsinline></video>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 let currentFile = null;
@@ -683,14 +722,15 @@ function applyLang() {
 function toggleLang() { lang = lang === 'ru' ? 'en' : 'ru'; lsSet('dlss5v_lang', lang); applyLang(); }
 
 // ── README modal ──
-function readmeOpen() { return $('readme-modal').style.display === 'flex'; }
+function readmeOpen() { const el = $('readme-modal'); return !!el && el.style.display === 'flex'; }
 function loadReadme() {
   fetch('/api/readme?lang=' + lang).then(r => r.json()).then(d => {
-    $('readme-content').textContent = d.ok ? d.content : (d.error || 'README unavailable');
-  }).catch(() => { $('readme-content').textContent = 'README unavailable'; });
+    const el = $('readme-content');
+    if (el) el.textContent = d.ok ? d.content : (d.error || 'README unavailable');
+  }).catch(() => { const el = $('readme-content'); if (el) el.textContent = 'README unavailable'; });
 }
-function openReadme() { $('readme-modal').style.display = 'flex'; loadReadme(); }
-function closeReadme() { $('readme-modal').style.display = 'none'; }
+function openReadme() { const el = $('readme-modal'); if (el) { el.style.display = 'flex'; loadReadme(); } }
+function closeReadme() { const el = $('readme-modal'); if (el) el.style.display = 'none'; }
 function toggleReadme() { readmeOpen() ? closeReadme() : openReadme(); }
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && readmeOpen()) closeReadme(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && cmpOpen()) closeCompare(); });
@@ -814,43 +854,6 @@ function toggleTheme() {
 applyLang();
 </script>
 
-<!-- README modal -->
-<div class="modal-overlay" id="readme-modal" onclick="if (event.target === this) closeReadme()">
-  <div class="modal">
-    <div class="modal-head">
-      <span>README</span>
-      <button class="help-btn modal-close" onclick="closeReadme()" title="Close">×</button>
-    </div>
-    <pre id="readme-content" style="white-space:pre-wrap; font-family:var(--mono); font-size:12.5px; color:var(--text-2); line-height:1.6"></pre>
-  </div>
-</div>
-
-<!-- Compare ДО/ПОСЛЕ modal -->
-<div class="compare-overlay" id="compare-overlay" onclick="if (event.target === this) closeCompare()">
-  <div class="compare-modal" id="compare-modal">
-    <div class="compare-head">
-      <span class="c-title" id="c-title"></span>
-      <span class="c-time" id="c-time">0:00 / 0:00</span>
-      <span style="display:flex;gap:10px;align-items:center;">
-        <button class="compare-btn" id="c-btn">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-          <span id="c-btn-label" data-i18n="comparePlay">Пуск</span>
-        </button>
-        <button class="help-btn modal-close" onclick="closeCompare()" title="Close">×</button>
-      </span>
-    </div>
-    <div class="compare-grid">
-      <div class="compare-col">
-        <div class="compare-lbl"><b data-i18n="compareBefore">ДО</b> · <span id="c-name-1"></span></div>
-        <video class="compare-video" id="cmp-video-1" muted playsinline></video>
-      </div>
-      <div class="compare-col">
-        <div class="compare-lbl"><b data-i18n="compareAfter">ПОСЛЕ NR</b> · <span id="c-name-2"></span></div>
-        <video class="compare-video" id="cmp-video-2" playsinline></video>
-      </div>
-    </div>
-  </div>
-</div>
 </body>
 </html>
 """
