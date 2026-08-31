@@ -17,6 +17,9 @@ mkdir -p "$output_dir"
   -I"$project_root/native/NVIDIA-DLSS/include" \
   "$project_root/native/DLSS5-Feeder/host/dlss5-feed-host64.cpp" \
   "$project_root/native/NVIDIA-DLSS/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib" \
+  -Wl,/nodefaultlib:msvcprt \
+  -Wl,/nodefaultlib:MSVCRT \
+  -Wl,/nodefaultlib:OLDNAMES \
   -lversion \
   -lkernel32 \
   -luser32 \
