@@ -13,7 +13,6 @@ mkdir -p "$output_dir"
   -O2 \
   -static \
   -fms-extensions \
-  -fms-compatibility \
   -Wno-pragma-pack \
   -I"$project_root/native/NVIDIA-DLSS/include" \
   "$project_root/native/DLSS5-Feeder/host/dlss5-feed-host64.cpp" \
